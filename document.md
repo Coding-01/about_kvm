@@ -1,3 +1,4 @@
+[toc]
 1、项目背景
 ```shell
 
@@ -9,6 +10,78 @@ vCenter 成本越来越高
 
 因此越来越多企业开始寻找低成本虚拟化替代方案
 其中KVM + QEMU + libvirt 已经成为Linux 世界事实上的标准虚拟化方案。
+
+为什么选择KVM,因为KVM属于Linux Kernel 原生虚拟化，相比VMware：
+优势
+1）无高额授权成本
+适合：
+中小企业
+边缘计算
+私有云
+IDC
+2）与 Linux 深度整合
+包括：
+cgroups
+systemd
+nftables
+NUMA
+hugepages
+3）云生态完整
+包括：
+OpenStack
+Proxmox
+oVirt
+Kubernetes 虚拟化
+4）更适合自动化
+包括：
+virsh
+libvirt
+Terraform
+Ansible
+
+很多人认为KVM只是VMware替代品, 实际上企业真正看中的是Linux 原生虚拟化生态
+KVM最大优势不是 "免费" 而是可控, 包括：
+Linux 原生
+自动化
+云生态
+API
+OpenStack
+Kubernetes
+Ceph
+
+# 企业推荐虚拟磁盘方案
+实验环境推荐qcow2, 生产环境更推荐raw或者LVM
+qcow2优点：
+snapshot
+thin provisioning
+节省空间
+
+企业更喜欢raw是因为性能更高
+qcow2存在：
+metadata
+copy-on-write
+fragmentation
+
+不建议所有VM放一个目录
+错误示例 /var/lib/libvirt/images/ 全部混在一起
+推荐结构, 例如：
+/vm/
+ ├── prod/
+ ├── test/
+ ├── backup/
+ └── template/
+
+
+
+很多人认为 qemu-img convert 就是迁移
+实际上真正困难的是以下这些兼容层问题：
+Snapshot chain
+EFI/BIOS
+Storage controller
+initramfs
+virtio
+grub
+network migration
 
 
 本项目目标：
@@ -61,6 +134,189 @@ virsh		CLI管理工具
 virt-install	创建VM
 virt-manager	GUI管理器
 
+
+# 解决vmware workstation17pro上的网络混杂模式(没找到这些操作)
+VMware Workstation 17 Pro
+进入Edit →  Virtual Network Editor
+找到VMnet0
+如果 Bridge to physical NIC
+然后开启：
+Promiscuous Mode
+→ Allow All
+
+企业迁移标准做法(重点): 迁移前必须先 consolidation,即合并 Snapshot
+为什么必须先合并? 
+因为KVM虽然支持部分 snapshot chain
+但VMware Snapshot兼容性并不可靠, 尤其以下几种情况风险极高
+多层 snapshot
+加密 vmdk
+NVMe snapshot
+linked clone
+
+
+# 加密 VMDK 注意事项
+如果 Encrypted Virtual Machine 则 qemu-img 无法直接转换
+必须先在 VMware 内解密
+
+# 如何确认是否加密,查看：
+qemu-img info xxx.vmdk
+
+如果异常：
+Unsupported or invalid disk type 或者 Permission denied
+可能为加密VMDK
+
+# 解密方式
+VMware VM
+→ Settings
+→ Encryption
+→ Remove Encryption
+
+企业里真正推荐策略（重点）
+永远不要直接迁移生产VM
+
+而是
+标准流程：
+生产 VM
+ ↓
+完整克隆
+ ↓
+迁移 clone
+ ↓
+验证
+ ↓
+正式切换
+
+
+# 企业推荐网络结构
+NAT不适合生产, 更适合：
+测试
+实验
+Nested
+
+生产通常是bridge
+Linux bridge企业方案, 例如：
+bond0
+ ↓
+br0
+ ↓
+KVM VM
+
+bridge更适合是因为VM拥有独立IP, 适合以下场景：
+数据库
+Web
+Kubernetes
+OpenStack
+
+更大型环境通常用OVS(Open vSwitch),适合以下环境:
+VLAN
+VXLAN
+SDN
+OpenStack
+
+企业推荐CPU配置 --cpu host-passthrough
+优点：
+性能更高
+CPU 指令完整
+NUMA 更友好
+
+什么是 HugePages
+Linux默认是4KB page
+HugePages例如2MB、1GB
+
+为什么NUMA很重要, 多CPU服务器,内存不是统一的
+
+企业优化方向, 包括：
+CPU pinning
+NUMA binding
+isolcpus
+
+KVM企业高级优化, 包括：
+vCPU pinning
+emulatorpin
+iothreadpin
+
+virtio-scsi比virtio-blk更推荐
+因为它支持：
+多队列
+热插拔
+SCSI passthrough
+企业兼容
+
+企业数据库通常是virtio-scsi
+企业生产环境强烈建议安装guest-agent
+sudo dnf install qemu-guest-agent -y
+sudo systemctl enable --now qemu-guest-agent
+作用包括:
+获取 VM IP
+freeze filesystem
+backup
+graceful shutdown
+
+企业不推荐长期snapshot是因为snapshot会导致：
+IO下降
+chain复杂
+metadata增长
+风险增加
+
+snapshot只做短期, 长期应该backup
+企业推荐备份包括：
+rsync
+borgbackup
+PBS
+Veeam
+Ceph snapshot
+
+
+企业迁移标准流程
+1. 分析 VMware VM
+   ↓
+2. 判断 BIOS/EFI
+   ↓
+3. 判断 Snapshot
+   ↓
+4. consolidation
+   ↓
+5. clone
+   ↓
+6. vmdk → qcow2
+   ↓
+7. virt-install
+   ↓
+8. dracut repair
+   ↓
+9. grub repair
+   ↓
+10. network repair
+   ↓
+11. install guest-agent
+   ↓
+12. benchmark
+   ↓
+13. backup
+   ↓
+14. production cutover
+
+
+企业迁移里最值钱的能力不是 apt install qemu-kvm 而是排错能力
+真正值钱的是：
+dracut
+initramfs
+grub
+EFI
+storage controller
+snapshot chain
+network migration
+
+2026年大量企业因为以下原因都在kvm化
+VMware成本压力
+老旧ESXi
+国产化
+OpenStack
+边缘计算
+
+
+
+
 ```
 
 
@@ -103,6 +359,44 @@ Ubuntu更适合：桌面、AI、新硬件
 qemu-img info xxx.vmdk
 qemu-img convert -p -f vmdk test.vmdk -O qcow2 test.qcow2
 
+虽然KVM可以直接读取VMDK, 但企业生产不推荐,原因如下:
+性能
+snapshot兼容
+metadata兼容
+lock问题
+VMware特性残留
+
+
+# 为什么推荐qcow2
+KVM 常见磁盘格式：
+格式	特点
+raw	性能高
+qcow2	灵活
+vmdk	VMware
+
+企业迁移通常推荐qcow2
+
+# QCOW2优势包括
+支持 snapshot
+thin provisioning
+压缩
+稀疏文件
+更适合KVM/libvirt
+
+转换前重要原则(重点)必须保证：
+VMDK已consolidation
+即已删除所有snapshot 或者 已完整clone
+否则极容易数据损坏
+
+企业推荐磁盘类型
+生产环境通常：
+场景        推荐
+OpenStack   qcow2
+Proxmox	    raw/lvm
+Ceph	    raw
+测试环境    qcow2
+
+
 2、virtio (重中之重)
 企业性能核心
 包括：
@@ -135,15 +429,12 @@ base.vmdk
 真正数据可能在最后 delta disk
 
 
-
-
 ```
 
 
 
 
 # 最优学习路线
-
 ```shell
 第一阶段
 单机：
@@ -385,7 +676,7 @@ cloud-init
 
 
 
-现在先找 VMware VM 的 vmdk 文件（重点）
+现在先找 VMware VM 的 vmdk 文件(重点)
 在VMware Workstation找到你的VM目录
 
 
@@ -490,6 +781,31 @@ alma9-1-1.vmdk
 alma9-1-2.vmdk
 
 
+# VMware如何判断EFI
+rambo@e8bit:~/v_machine$ cat xxx.vmx
+注: 如存在firmware = "efi" 则说明是EFI，如无则通常是BIOS
+
+# EFI 与 BIOS 最大区别
+BIOS使用/boot/grub2
+EFI使用/boot/efi
+
+为什么EFI更容易翻车, 因为涉及：
+NVRAM
+OVMF
+EFI partition
+boot entry
+
+
+迁移前必须先判断：
+项目            内容
+firmware        BIOS/EFI
+controller      NVMe/SCSI/SATA
+network	        vmxnet3/e1000
+snapshot        是否存在
+encryption      是否加密
+
+
+
 
 命令完整克隆
 rambo@e8bit:~/v_machine$ cp -ar alma9-1  alma9-1-bak      # 完整复制vm
@@ -530,7 +846,7 @@ rambo@e8bit:~/v_machine/alma9-1-bak$ ls -alh alma9-1-clone.vmdk
 -rw------- 1 rambo rambo 3.2G  5月 21 22:50 alma9-1-clone.vmdk
 注意：它已经是完整磁盘
 
-然后验证 clone（非常重要）
+# 然后验证clone(非常重要)
 rambo@e8bit:~/v_machine/alma9-1-bak$ qemu-img info alma9-1-clone.vmdk 
 image: alma9-1-clone.vmdk
 file format: vmdk
@@ -722,6 +1038,9 @@ rambo@debian1:/var/lib/libvirt/images$ which virt-install
 /usr/bin/virt-install
 
 
+相比virt-manager,命令行更适合: 自动化、企业运维、CI/CD、批量迁移
+
+
 开始真正创建VM(核心)
 rambo@debian1:/var/lib/libvirt/images$ cd
 rambo@debian1:~$ sudo virt-install \
@@ -735,9 +1054,27 @@ rambo@debian1:~$ sudo virt-install \
 --import \
 --graphics none
 
+虽然--graphics none可用, 但迁移初期不建议, 因为启动失败时：
+看不到 dracut
+看不到 grub
+不方便排错
 
-不要关闭当前 console,另开ssh
-执行virsh list --all
+virtio本质属于半虚拟化驱动, 相比以下几种性能高很多:
+IDE
+SATA
+e1000
+
+virtio-scsi相比virtio-blk的优势:
+多队列
+热插拔
+更适合数据库
+企业兼容更好
+
+企业后续建议, 迁移完成后从 virtio-blk 升级virtio-scsi
+
+
+不要关闭当前console, 另开ssh登录到debian12上
+rambo@debian1:~$ virsh list --all
 
 
 迁移前注意存储控制器变化
@@ -786,15 +1123,59 @@ kernel：✅ 正常加载
 但磁盘根本识别不出来，于是timeout，这就是企业迁移里最经典问题
 尤其VMware → KVM/OpenStack
 
+
+迁移后最容易启动失败是因为VMware 与 KVM虚拟硬件完全不同, 因此系统原来的initramfs,可能根本不包含KVM驱动
+例如：
+VMware       KVM
+vmxnet3	     virtio-net
+NVMe         virtio-blk
+LSI Logic    virtio-scsi
+
+
+启动后卡在:
+dracut-initqueue timeout
+或者：
+Warning: /dev/disk/by-uuid/xxx does not exist
+本质原因是initramfs 里没有 virtio 驱动,导致系统无法识别磁盘
+
+VMware不会出现是因为原系统使用：
+NVMe
+vmware pvscsi
+LSI Logic
+
+而KVM使用：
+virtio-blk
+virtio-scsi
+
+所以storage controller 已变化
+
+RHEL/Alma/CentOS 更容易出现是因为默认hostonly=yes，即initramfs 只包含当前机器驱动，不是通用驱动
+
+
+网络迁移 最经典问题
+VMware 网卡是 ens160，KVM可能 ens3 导致 NetworkManager 找不到接口
+修复方式
+ip a
+vim /etc/NetworkManager/system-connections/
+或
+vim /etc/sysconfig/network-scripts/
+企业更推荐nmcli
+例如nmcli connection show
+修改 nmcli connection modify
+
+
+
+
 ```
 ![image](./images/1.png)
 ![image](./images/2.png)
 
 ```
-# 解决
+
+# 标准企业修复流程
 先把Alma的 ISO放到 Debian12 的 /var/lib/libvirt/boot/ 中
 
-# 重新挂ISO创建VM(重点)
+# 重新挂ISO创建VM(重点)创建rescue VM
 rambo@debian1:~$ sudo virt-install \
 --name alma9-fix \
 --memory 4096 \
@@ -816,8 +1197,39 @@ rambo@debian1:~$ sudo ls -alh /var/lib/libvirt/boot/
 <font color=red>**它会自动搜索并挂载Alma9，通常是 /mnt/sysroot 或 /mnt/sysimage**</font>
 ![image](./images/6.png)
 ![image](./images/7.png)
-<font color=red>**之所以要建议重建grub是因为从VMware NVMe迁移到了KVM virtio**</font>
-<font color=red>**查看磁盘 fdisk -l /dev/vda**</font>
+```shell
+之所以要建议重建grub是因为从VMware NVMe迁移到了KVM virtio
+查看磁盘 fdisk -l /dev/vda
+重建 initramfs: dracut -f --regenerate-all
+
+这一步能修复是因为现在系统看到的是
+virtio-blk
+dracut会自动把：
+virtio
+virtio_blk
+virtio_pci
+virtio_scsi
+
+写入initramfs
+
+# 企业里真正修复的不是grub而是驱动层, 验证 virtio 模块, 可选：
+lsinitrd | grep virtio
+
+正常会看到：
+virtio_blk
+virtio_pci
+
+# 修复grub(重要)
+BIOS系统
+grub2-mkconfig -o /boot/grub2/grub.cfg
+再
+grub2-install /dev/vda
+
+# 为什么是/dev/vda
+因为KVM virtio设备名通常/dev/vda, 不是VMware原来的/dev/nvme0n1
+
+
+```
 ![image](./images/8.png)
 ![image](./images/9.png)
 ![image](./images/10.png)
@@ -965,13 +1377,36 @@ vhost-net
 
 ## KVM正确EFI启动方式(重点)
 ```shell
-必须OVMF,OVMF简单说
+必须安装OVMF,OVMF简单说
 QEMU/KVM 的 UEFI firmware, 相当于虚拟版UEFI BIOS
 Debian12安装(重要) sudo apt install ovmf -y
 # 确认文件存在
 ls /usr/share/OVMF/        # 正常应有如下2个文件
 OVMF_CODE.fd
 OVMF_VARS.fd
+
+如原VMware是EFI则KVM必须使用OVMF
+
+BIOS/EFI不匹配会失败是因为, 例如原系统是EFI，现在KVM是BIOS, 则grub无法找到EFI boot
+反之也可能无法启动
+
+# EFI系统(重点)
+如果原系统是EFI
+则不要grub2-install /dev/vda
+应该grub2-mkconfig -o /boot/efi/EFI/almalinux/grub.cfg
+EFI更推荐使用 efibootmgr 修复 boot entry
+
+如何判断当前是EFI
+ls /sys/firmware/efi
+存在则说明是EFI
+
+
+
+
+
+
+
+
 
 EFI VM正确创建方式(重点)
 sudo virt-install \
@@ -1048,3 +1483,33 @@ virsh start alma9
 virsh console alma9
 退出 Ctrl + ]
 
+
+
+截止到现在完成的已经不是"安装KVM"
+
+而是企业级 VMware → KVM 迁移链路
+包括：
+✅ snapshot
+✅ clone
+✅ vmdk
+✅ qcow2
+✅ virt-install
+✅ virtio
+✅ dracut
+✅ initramfs
+✅ grub
+✅ EFI
+✅ network migration
+✅ libvirt
+
+```
+
+
+
+
+# 
+```shell
+
+
+
+```
