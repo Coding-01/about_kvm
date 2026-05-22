@@ -643,6 +643,12 @@ VMware bridge
 所以不会再触发 VMware 网卡的混杂模式(安全限制)
 
 
+# 宿主机开启数据转发(Debian12上)
+rambo@debian1:~$ echo 'net.ipv4.ip_forward = 1' | sudo tee -a /etc/sysctl.conf 
+rambo@debian1:~$ sudo sysctl -p
+
+
+
 
 马上会开始接触：
 qcow2
@@ -1662,6 +1668,45 @@ rambo@debian1:~$ virsh list --all
  2    ubuntu24-clone   running
 
 
+启动VM
+rambo@debian1:~$ virsh start ubuntu24-clone
+
+进入控制台（重点）
+rambo@debian1:~$ virsh console ubuntu24-clone
+退出 Ctrl + ]
+如此时需往里输入命令则你需要先按一下回车键。如果系统已经启动完成，通常会蹦出Ubuntu的用户登录提示符，输入用户名和密码后即可正常操>作
+
+如果按回车依旧没反应就先用快捷键 Ctrl + ] 退出当前的console挂起状态。因为virt-install启动命令里有 --graphics vnc,listen=0.0.0.0，
+可直接在外面用VNC Viewer连接宿主机的5901端口，在图形界面里登录系统
+
+在图形界面(或VNC)登入系统后，如以后想通过virsh console命令行直接控制它，需要在虚拟机内部执行以下命令，启用串行控制台服务：
+sudo systemctl enable --now serial-getty@ttyS0.service
+
+# 再来登录
+rambo@debian1:~$ virsh console ubuntu24-clone
+Connected to domain 'ubuntu24-clone'
+Escape character is ^] (Ctrl + ])
+
+ub24 login: rambo              # 这里即可输入用户名和密码
+Password: 
+Welcome to Ubuntu 24.04.1 LTS (GNU/Linux 6.17.0-29-generic x86_64)
+
+ * Documentation:  https://help.ubuntu.com
+ * Management:     https://landscape.canonical.com
+ * Support:        https://ubuntu.com/pro
+
+Expanded Security Maintenance for Applications is not enabled.
+
+243 updates can be applied immediately.
+To see these additional updates run: apt list --upgradable
+
+Enable ESM Apps to receive additional future security updates.
+See https://ubuntu.com/esm or run: sudo pro status
+
+rambo@ub24:~$ 
+
+
+
 rambo@debian1:~$ sudo netstat -anpt | grep 590
 tcp        0      0 127.0.0.1:5900          0.0.0.0:*               LISTEN      8377/qemu-system-x8 
 tcp        0      0 0.0.0.0:5901            0.0.0.0:*               LISTEN      9803/qemu-system-x8 
@@ -1673,7 +1718,139 @@ tcp        0      0 172.16.186.194:5901     172.16.186.1:38178      ESTABLISHED 
 ![image](./images/11.png)
 
 
-```
+```shell
+进去后 ping 不通互联网的原因与排查
+原 VMware 虚拟机迁移到 KVM 后网络断开，属于必然现象。其核心原因在于 底层物理网卡驱动和设备名称发生了改变。
+
+在 VMware 中，网卡通常是 e1000 或 vmxnet3，Ubuntu 给它分配的名称一般是 ens33 或 ens160。而在KVM中，因为指定了 model=virtio，网卡变成了 VirtIO 网络设备，Ubuntu识别到的新名称通常是enp1s0 或 enp0s3
+
+由于网卡配置文件的设备名对不上，Ubuntu 的网络服务(Netplan)根本无法拉起新网卡
+
+修复步骤：
+第一步：在虚拟机内查看当前真实的新网卡名称
+rambo@ub24:~$ ip a
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000
+    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+    inet 127.0.0.1/8 scope host lo
+       valid_lft forever preferred_lft forever
+    inet6 ::1/128 scope host noprefixroute 
+       valid_lft forever preferred_lft forever
+2: enp1s0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc pfifo_fast state UP group default qlen 1000
+    link/ether 52:54:00:3a:48:78 brd ff:ff:ff:ff:ff:ff
+    inet 192.168.122.234/24 brd 192.168.122.255 scope global dynamic noprefixroute enp1s0
+       valid_lft 2435sec preferred_lft 2435sec
+    inet6 fe80::1d09:65a3:cf9d:1205/64 scope link noprefixroute 
+       valid_lft forever preferred_lft forever
+
+
+rambo@ub24:~$ sudo vim /etc/netplan/50-cloud-init.yaml
+network:
+  version: 2
+  renderer: networkd          # 应该也要手动加这一项
+  ethernets:
+    enp1s0:                   # 确保这里是新网卡名
+      dhcp4: true
+
+rambo@ub24:~$ sudo chmod 600 /etc/netplan/*.yaml
+rambo@ub24:~$ sudo netplan apply
+
+
+# 测试网络连通性
+rambo@ub24:~$ ping -c3 qq.com
+PING qq.com (113.108.81.189) 56(84) bytes of data.
+From 192.168.122.1 icmp_seq=1 Destination Net Unreachable
+From 192.168.122.1 icmp_seq=2 Destination Net Unreachable
+From 192.168.122.1 icmp_seq=3 Destination Net Unreachable
+
+--- qq.com ping statistics ---
+3 packets transmitted, 0 received, +3 errors, 100% packet loss, time 2004ms
+
+
+# 来宿主机上排查问题
+rambo@debian1:~$ sudo iptables -t nat -L -v -n
+Chain PREROUTING (policy ACCEPT 0 packets, 0 bytes)
+ pkts bytes target     prot opt in     out     source               destination         
+
+Chain INPUT (policy ACCEPT 0 packets, 0 bytes)
+ pkts bytes target     prot opt in     out     source               destination         
+
+Chain OUTPUT (policy ACCEPT 0 packets, 0 bytes)
+ pkts bytes target     prot opt in     out     source               destination         
+
+Chain POSTROUTING (policy ACCEPT 0 packets, 0 bytes)
+ pkts bytes target     prot opt in     out     source               destination         
+  502 51653 LIBVIRT_PRT  0    --  *      *       0.0.0.0/0            0.0.0.0/0           
+
+Chain LIBVIRT_PRT (1 references)
+ pkts bytes target     prot opt in     out     source               destination         
+    5   365 RETURN     0    --  *      *       192.168.122.0/24     224.0.0.0/24        
+    0     0 RETURN     0    --  *      *       192.168.122.0/24     255.255.255.255     
+    0     0 MASQUERADE  6    --  *      *       192.168.122.0/24    !192.168.122.0/24     masq ports: 1024-65535
+    0     0 MASQUERADE  17   --  *      *       192.168.122.0/24    !192.168.122.0/24     masq ports: 1024-65535
+    0     0 MASQUERADE  0    --  *      *       192.168.122.0/24    !192.168.122.0/24    
+rambo@debian1:~$ sudo iptables -L FORWARD -v -n
+Chain FORWARD (policy ACCEPT 0 packets, 0 bytes)
+ pkts bytes target     prot opt in     out     source               destination         
+    0     0 LIBVIRT_FWX  0    --  *      *       0.0.0.0/0            0.0.0.0/0           
+    0     0 LIBVIRT_FWI  0    --  *      *       0.0.0.0/0            0.0.0.0/0           
+    0     0 LIBVIRT_FWO  0    --  *      *       0.0.0.0/0            0.0.0.0/0           
+rambo@debian1:~$ ip route show
+172.16.186.0/24 dev ens33 proto kernel scope link src 172.16.186.194 
+192.168.122.0/24 dev virbr0 proto kernel scope link src 192.168.122.1 
+注: 没有默认路由
+1、临时手动添加路由来实现修复宿主机路由(立即生效)
+rambo@debian1:~$ sudo ip route add default via 172.16.186.2 dev ens33
+rambo@debian1:~$ ip route show
+default via 172.16.186.2 dev ens33 
+172.16.186.0/24 dev ens33 proto kernel scope link src 172.16.186.194 
+192.168.122.0/24 dev virbr0 proto kernel scope link src 192.168.122.1 
+
+添加后，立刻在宿主机上测试网络,如能ping通则说明宿主机外网恢复
+rambo@debian1:~$ ping -c3 qq.com
+PING qq.com (123.150.76.218) 56(84) bytes of data.
+64 bytes from 123.150.76.218 (123.150.76.218): icmp_seq=1 ttl=128 time=19.6 ms
+64 bytes from 123.150.76.218 (123.150.76.218): icmp_seq=2 ttl=128 time=19.8 ms
+64 bytes from 123.150.76.218 (123.150.76.218): icmp_seq=3 ttl=128 time=19.9 ms
+
+# 测试虚拟机网络
+rambo@ub24:~$ ping -c3 qq.com
+PING qq.com (113.108.81.189) 56(84) bytes of data.
+64 bytes from 113.108.81.189: icmp_seq=1 ttl=127 time=36.6 ms
+64 bytes from 113.108.81.189: icmp_seq=2 ttl=127 time=37.9 ms
+64 bytes from 113.108.81.189: icmp_seq=3 ttl=127 time=36.8 ms
+
+此时宿主机的 iptables NAT 规则就会真正开始工作，虚拟机的网络包就能顺利通过宿主机的 ens33 转发到公网
+
+持久化宿主机网络配置（防止重启失效）
+临时路由重启就没了。你需要检查 debian1 的网络配置文件：
+
+
+如果你的Debian(宿主机)使用的是传统的ifupdown，则修改:
+rambo@ub24:~$ sudo vim /etc/network/interfaces
+source /etc/network/interfaces.d/*
+
+# The loopback network interface
+auto lo
+iface lo inet loopback
+
+auto ens33
+iface ens33 inet static
+    address 172.16.186.194
+    netmask 255.255.255.0
+    gateway 172.16.186.2              # 确保这一行存在且正确
+    dns-nameservers 172.16.186.2 114.114.114.114 8.8.8.8
+注: 宿主机本身是不应该(也没必要)把它的上游DNS指向虚拟机内网的,当然指向也可以
+
+编辑interfaces文件好后不需要重启整台服务器。在企业级Linux运维中能不重启服务器就坚决不重启,以防万一
+用ifup自带的语法检查工具来验证配置文件的正确性，防止有错别字导致下次开机失败：
+rambo@debian1:~$ sudo ifup --no-act ens33
+ifup: interface ens33 already configure
+注: 无任何报错输出则说明配置文件语法过关
+
+# 平滑重载网络服务(无需重启系统)
+在Debian上让修改后的配置文件在后台生效，可直接重载networking服务：
+sudo systemctl reload networking
+
 # ===================================================
 企业里最常见报错：
 No boot device
@@ -1688,19 +1865,17 @@ driver
 这些兼容层
 # ===================================================
 
-创建后查看VM(重点)
-rambo@debian1:~$ virsh list --all
- Id   Name             State
---------------------------------
- 1    alma9            running
- 3    ubuntu24-clone   running
 
-启动VM
-rambo@debian1:~$ virsh start ubuntu24-clone
+```
 
-进入控制台（重点）
-rambo@debian1:~$ virsh console ubuntu24-clone
-退出 Ctrl + ]
+
+
+
+
+
+# FAQ
+```shell
+
 
 
 ```
@@ -1708,9 +1883,53 @@ rambo@debian1:~$ virsh console ubuntu24-clone
 
 
 
-# 
+
+
+
+
+# 迁移windows
+## 迁移win7
 ```shell
 
 
+
+```
+
+
+
+## 迁移win10
+```shell
+
+```
+
+
+## 迁移win11
+```shell
+
+
+```
+
+
+## 迁移winserver 2008
+```shell
+
+
+```
+
+
+## 迁移winserver 2012
+```shell
+
+```
+
+
+## 迁移winserver 2016
+```shell
+
+```
+
+
+## 迁移winserver 2019
+```shell
 
 ```
