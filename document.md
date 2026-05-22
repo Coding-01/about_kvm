@@ -1397,31 +1397,283 @@ BIOS/EFI不匹配会失败是因为, 例如原系统是EFI，现在KVM是BIOS, �
 应该grub2-mkconfig -o /boot/efi/EFI/almalinux/grub.cfg
 EFI更推荐使用 efibootmgr 修复 boot entry
 
-如何判断当前是EFI
-ls /sys/firmware/efi
-存在则说明是EFI
+在旧机上判断当前是EFI(在备份的基础上做)
+rambo@bit:~/v_machine/ubuntu24-1-英-bak$ grep firmware ubuntu24-1-英.vmx
+firmware = "efi"      # 存在该项则说明是EFI
 
 
+# 在旧机上检查并合并快照(Consolidation)
+rambo@bit:~/v_machine$ cp -ar ubuntu24-1-英  ubuntu24-1-英-bak
+rambo@bit:~/v_machine$ cd ubuntu24-1-英-bak 
+rambo@bit:~/v_machine/ubuntu24-1-英-bak$ ls -alh
+总计 14G
+drwxrwxr-x  4 rambo rambo 4.0K  5月 21 21:57 .
+drwxr-xr-x 43 rambo rambo 4.0K  5月 22 18:10 ..
+drwxrwxr-x  2 rambo rambo 4.0K  5月 20 17:52 mksSandbox
+-rw-r-----  1 rambo rambo  53K  5月 20 18:46 mksSandbox-0.log
+-rw-r-----  1 rambo rambo  57K  5月 20 18:43 mksSandbox-1.log
+-rw-r-----  1 rambo rambo  54K  5月 21 15:32 mksSandbox.log
+-rw-------  1 rambo rambo  11M  5月 20 18:46 ubuntu24-1-英-000001.vmdk
+-rw-------  1 rambo rambo 5.2G  5月 21 15:32 ubuntu24-1-英-000003.vmdk
+-rw-rw-r--  1 rambo rambo 7.5K  5月 20 18:46 ubuntu24-1-英-0.scoreboard
+-rw-rw-r--  1 rambo rambo 7.5K  5月 20 18:43 ubuntu24-1-英-1.scoreboard
+-rw-------  1 rambo rambo 265K  5月 21 07:58 ubuntu24-1-英.nvram
+-rw-rw-r--  1 rambo rambo 7.5K  5月 21 15:32 ubuntu24-1-英.scoreboard
+-rw-------  1 rambo rambo 285K  5月 20 18:46 ubuntu24-1-英-Snapshot1.vmsn
+-rw-------  1 rambo rambo 285K  5月 20 18:46 ubuntu24-1-英-Snapshot2.vmsn
+-rw-------  1 rambo rambo 8.8G  5月 20 18:46 ubuntu24-1-英.vmdk
+-rw-r--r--  1 rambo rambo  756  5月 20 18:46 ubuntu24-1-英.vmsd
+-rwx------  1 rambo rambo 3.3K  5月 21 15:32 ubuntu24-1-英.vmx
+-rw-------  1 rambo rambo  296  5月 21 07:57 ubuntu24-1-英.vmxf
+drwxrwxr-x  2 rambo rambo 4.0K  5月 21 17:46 ubuntu24-1-英.vmx.lck
+-rw-r--r--  1 rambo rambo 213K  5月 20 18:46 vmware-0.log
+-rw-r--r--  1 rambo rambo 262K  5月 20 18:43 vmware-1.log
+-rw-------  1 rambo rambo 233K  5月 21 15:32 vmware.log
+
+如果存在快照文件: 
+切记不能直接转base.vmdk。由于你已经是在备份目录操作，最稳妥的做法是确保你在VMware里已经对该虚拟机执行了"删除所有快照/合并快照(Consolidated)"，或者在转换时直接指定最新的那个 *-00000x.vmdk 差异磁盘进行转换
+
+如果已经是干净的、无快照的单个完整vmdk(例如ubuntu24-1-英.vmdk)，则直接进入下一步
+
+# 在旧机上完整克隆(合并所有快照)
+rambo@bit:~/v_machine/ubuntu24-1-英-bak$ ls -alh *.vmdk
+-rw------- 1 rambo rambo  11M  5月 20 18:46 ubuntu24-1-英-000001.vmdk
+-rw------- 1 rambo rambo 5.2G  5月 21 15:32 ubuntu24-1-英-000003.vmdk
+-rw------- 1 rambo rambo 8.8G  5月 20 18:46 ubuntu24-1-英.vmdk
+rambo@bit:~/v_machine/ubuntu24-1-英-bak$ vmware-vdiskmanager -r ubuntu24-1-英.vmdk -t 0 ubuntu24-1-英-clone.vmdk
+Creating disk 'ubuntu24-1-英-clone.vmdk'
+  Convert: 100% done.
+Virtual disk conversion successful.           # 说明snapshot chain已经被正确读取
+
+rambo@e8bit:~/v_machine/ubuntu24-1-英-bak$ ls -alh ubuntu24-1-英-clone.vmdk
+-rw------- 1 rambo rambo 8.8G  5月 22 18:56 ubuntu24-1-英-clone.vmdk
+
+# 在旧机上验证克隆
+rambo@bit:~/v_machine/ubuntu24-1-英-bak$ qemu-img info ubuntu24-1-英-clone.vmdk
+image: ubuntu24-1-英-clone.vmdk
+file format: vmdk
+virtual size: 80 GiB (85899345920 bytes)
+disk size: 8.71 GiB
+cluster_size: 65536
+Format specific information:
+    cid: 1358216815
+    parent cid: 4294967295
+    create type: monolithicSparse
+    extents:
+        [0]:
+            virtual size: 85899345920
+            filename: ubuntu24-1-英-clone.vmdk
+            cluster size: 65536
+            format: 
 
 
+# 在旧机上将克隆合并后的单体vmdkK磁盘传输至kvm宿主机(就是debian12那台)
+rambo@bit:~/v_machine/ubuntu24-1-英-bak$ scp ubuntu24-1-英-clone.vmdk rambo@172.16.186.194:~
+注: 194是debian12的IP
+
+# 来到debian12上
+rambo@debian1:~$ ls -alh ubuntu24-1-英-clone.vmdk 
+-rw------- 1 rambo rambo 8.8G May 21 16:19 ubuntu24-1-英-clone.vmdk
+
+rambo@debian1:~$ sudo cp ubuntu24-1-英-clone.vmdk  /var/lib/libvirt/images/
+rambo@debian1:~$ cd /var/lib/libvirt/images/
+
+# 开始转换
+rambo@debian1:/var/lib/libvirt/images$ sudo qemu-img convert \
+-p \
+-f vmdk ubuntu24-1-英-clone.vmdk\
+-O qcow2 ubuntu24-1-英-clone.qcow2
+
+rambo@debian1:/var/lib/libvirt/images$ sudo ls -alh 
+total 24G
+drwx--x--x 2 root         root         4.0K May 21 16:49 .
+drwxr-xr-x 7 root         root         4.0K May 21 07:24 ..
+-rw------- 1 root         root         3.2G May 21 09:40 alma9-1-clone.vmdk
+-rw-r--r-- 1 libvirt-qemu libvirt-qemu 3.4G May 21 16:51 alma9-1.qcow2
+-rw-r--r-- 1 root         root         8.8G May 21 16:52 ubuntu24-1-英-clone.qcow2
+-rw------- 1 root         root         8.8G May 21 16:24 ubuntu24-1-英-clone.vmdk
 
 
+rambo@debian1:/var/lib/libvirt/images$ sudo chown libvirt-qemu:libvirt-qemu /var/lib/libvirt/images/ubuntu24-1-英-clone.qcow2
+rambo@debian1:/var/lib/libvirt/images$ sudo chmod 660 /var/lib/libvirt/images/ubuntu24-1-英-clone.qcow2
 
 
+这里其实已经完成企业迁移最核心部分，下一步才是真正KVM启动验证
 
-EFI VM正确创建方式(重点)
-sudo virt-install \
---name alma9 \
---memory 4096 \
+
+# 使用virt-install创建KVM虚拟机(关键:指定OVMF / EFI固件)
+# 查看原虚拟机的配置
+rambo@e8bit:~/v_machine/ubuntu24-1-英-bak$ cat ubuntu24-1-英.vmx
+#!/usr/bin/vmware
+.encoding = "UTF-8"
+displayName = "ubuntu24-1-英"
+config.version = "8"
+virtualHW.version = "21"
+mks.enable3d = "TRUE"
+pciBridge0.present = "TRUE"
+pciBridge4.present = "TRUE"
+pciBridge4.virtualDev = "pcieRootPort"
+pciBridge4.functions = "8"
+pciBridge5.present = "TRUE"
+pciBridge5.virtualDev = "pcieRootPort"
+pciBridge5.functions = "8"
+pciBridge6.present = "TRUE"
+pciBridge6.virtualDev = "pcieRootPort"
+pciBridge6.functions = "8"
+pciBridge7.present = "TRUE"
+pciBridge7.virtualDev = "pcieRootPort"
+pciBridge7.functions = "8"
+vmci0.present = "TRUE"
+hpet0.present = "TRUE"
+nvram = "ubuntu24-1-英.nvram"
+virtualHW.productCompatibility = "hosted"
+powerType.powerOff = "soft"
+powerType.powerOn = "soft"
+powerType.suspend = "soft"
+powerType.reset = "soft"
+guestOS = "ubuntu-64"
+tools.syncTime = "FALSE"
+sound.autoDetect = "TRUE"
+sound.fileName = "-1"
+sound.present = "TRUE"
+numvcpus = "6"
+cpuid.coresPerSocket = "3"
+vcpu.hotadd = "TRUE"
+memsize = "16384"
+mem.hotadd = "TRUE"
+scsi0.virtualDev = "lsilogic"
+scsi0.present = "TRUE"
+sata0.present = "TRUE"
+scsi0:0.fileName = "ubuntu24-1-英-000003.vmdk"                  # 磁盘类型是scsi，这里要注意
+scsi0:0.present = "TRUE"
+sata0:1.deviceType = "cdrom-image"
+sata0:1.fileName = "/home/rambo/下载/iso/ubuntu-24.04.1-desktop-amd64.iso"
+sata0:1.present = "TRUE"
+usb.present = "TRUE"
+svga.graphicsMemoryKB = "8388608"
+ethernet0.connectionType = "nat"
+ethernet0.addressType = "generated"
+ethernet0.virtualDev = "e1000"        
+ethernet0.present = "TRUE"
+extendedConfigFile = "ubuntu24-1-英.vmxf"
+floppy0.present = "FALSE"
+firmware = "efi"
+vmxstats.filename = "ubuntu24-1-英.scoreboard"
+uuid.bios = "56 4d 99 b2 59 f1 9f a9-33 a7 69 a4 f5 03 a2 90"
+uuid.location = "56 4d 99 b2 59 f1 9f a9-33 a7 69 a4 f5 03 a2 90"
+pciBridge0.pciSlotNumber = "17"
+pciBridge4.pciSlotNumber = "21"
+pciBridge5.pciSlotNumber = "22"
+pciBridge6.pciSlotNumber = "23"
+pciBridge7.pciSlotNumber = "24"
+scsi0.pciSlotNumber = "16"
+usb.pciSlotNumber = "32"
+ethernet0.pciSlotNumber = "33"
+sound.pciSlotNumber = "34"
+sata0.pciSlotNumber = "35"
+scsi0:0.redo = ""
+svga.vramSize = "268435456"
+vmotion.checkpointFBSize = "4194304"
+vmotion.checkpointSVGAPrimarySize = "268435456"
+vmotion.svga.mobMaxSize = "1073741824"
+vmotion.svga.graphicsMemoryKB = "8388608"
+vmotion.svga.supports3D = "1"
+vmotion.svga.baseCapsLevel = "9"
+vmotion.svga.maxPointSize = "189"
+vmotion.svga.maxTextureSize = "16384"
+vmotion.svga.maxVolumeExtent = "2048"
+vmotion.svga.maxTextureAnisotropy = "16"
+vmotion.svga.lineStipple = "1"
+vmotion.svga.dxMaxConstantBuffers = "15"
+vmotion.svga.dxProvokingVertex = "1"
+vmotion.svga.sm41 = "1"
+vmotion.svga.multisample2x = "1"
+vmotion.svga.multisample4x = "1"
+vmotion.svga.msFullQuality = "1"
+vmotion.svga.logicOps = "1"
+vmotion.svga.bc67 = "9"
+vmotion.svga.sm5 = "1"
+vmotion.svga.multisample8x = "1"
+vmotion.svga.logicBlendOps = "1"
+vmotion.svga.maxForcedSampleCount = "16"
+vmotion.svga.gl43 = "1"
+ethernet0.generatedAddress = "00:0c:29:03:a2:90"
+ethernet0.generatedAddressOffset = "0"
+vmci0.id = "-184311152"
+monitor.phys_bits_used = "45"
+cleanShutdown = "TRUE"
+softPowerOff = "TRUE"
+usb:1.speed = "2"
+usb:1.present = "TRUE"
+usb:1.deviceType = "hub"
+usb:1.port = "1"
+usb:1.parent = "-1"
+svga.guestBackedPrimaryAware = "TRUE"
+usb:0.present = "TRUE"
+usb:0.deviceType = "hid"
+usb:0.port = "0"
+usb:0.parent = "-1"
+
+
+rambo@debian1:~$ sudo virt-install \
+--name ubuntu24-clone  \
+--ram 4096 \
 --vcpus 2 \
 --cpu host-passthrough \
---disk /var/lib/libvirt/images/alma9.qcow2,format=qcow2,bus=virtio \
---network network=default,model=virtio \
---os-variant almalinux9 \
---boot uefi \         # 重点，libvirt会自动加载OVMF
---import \
---graphics none
+--disk path=/var/lib/libvirt/images/ubuntu24-1-英-clone.qcow2,bus=virtio,format=qcow2 \
+--network bridge=virbr0,model=virtio \
+--boot uefi \                                  # 重点，libvirt会自动加载OVMF
+--graphics vnc,listen=0.0.0.0 \
+--noautoconsole \
+--os-variant ubuntu22.10 \
+--import
 
+注: 根据你宿主机的实际网桥名如 br0 或 virbr0 调整 --network项
+核心参数：
+--boot uefi：这是对应你 firmware = "efi" 最关键的一步，KVM会自动为其分配OVMF固件引导
+bus=virtio 和 model=virtio：直接采用半虚拟化驱动以获取企业级性能
+
+
+# 查看系统支持的所有可选值 (--os-variant的可选值)
+rambo@debian1:~$ osinfo-query os | grep -i ubuntu                     # 新方法
+rambo@debian1:~$ virt-install --osinfo list | grep -i ubuntu          # 旧方法
+ubuntu22.10, ubuntukinetic
+ubuntu-lts-latest, ubuntu-stable-latest, ubuntu22.04, ubuntujammy
+注: 
+可以看到最高支持到ubuntu22, 并没有24版本, 对于内核版本较新的 Ubuntu 24.04 来说，KVM宿主机在把它识别为ubuntu22.04时配置的底层硬件行为（如 ACPI 电源管理、RTC 时钟同步、VirtIO 默认驱动支持等）与 24.04 是高度一致的。这不会对虚拟机的运行带来任何性能损耗或不兼容问题
+
+#=================== 如需重新创建该vm ==============
+#1. 强制关闭虚拟机
+sudo virsh destroy ubuntu24-clone
+
+# 2. 从libvirt中彻底解除该虚拟机的定义
+sudo virsh undefine ubuntu24-clone --nvram
+# 重新执行 sudo virt-install ....
+#===================================================
+
+rambo@debian1:~$ source .bashrc 
+rambo@debian1:~$ virsh uri
+qemu:///system
+
+rambo@debian1:~$ virsh list --all
+ Id   Name             State
+--------------------------------
+ 1    alma9            running
+ 2    ubuntu24-clone   running
+
+
+rambo@debian1:~$ sudo netstat -anpt | grep 590
+tcp        0      0 127.0.0.1:5900          0.0.0.0:*               LISTEN      8377/qemu-system-x8 
+tcp        0      0 0.0.0.0:5901            0.0.0.0:*               LISTEN      9803/qemu-system-x8 
+tcp        0      0 172.16.186.194:5901     172.16.186.1:38178      ESTABLISHED 9803/qemu-system-x8 
+用远程连接工具去连接172.16.186.194:5901就能看到如下画面
+
+```
+
+![image](./images/11.png)
+
+
+```
 # ===================================================
 企业里最常见报错：
 No boot device
@@ -1436,72 +1688,20 @@ driver
 这些兼容层
 # ===================================================
 
-这条命令到底干了什么?
---import: 使用现有磁盘且不安装系统
---disk：指定qcow2
-bus=sata：第一次迁移最稳
---network network=default：使用 virbr0 NAT
---graphics none：纯命令行
---console pty,target_type=serial ：允许 virsh console 进入
-
-以下是回显：
-Starting install...
-Creating domain...                         |    0 B  00:00:00     
-Running text console command: virsh --connect qemu:///system console alma9          # 已经接入串口控制台
-Connected to domain 'alma9'                                                         # libvirt domain已创建成功
-Escape character is ^] (Ctrl + ])
-释义：
-成功创建并启动了第一个KVM迁移VM
-
-这里有个关键点（重要）
-很多VMware Linux VM默认没开启 serial console，所以现在可能是黑屏或没输出
-这不代表启动失败（重点）
-因为现在连接的是serial console不是VGA
-等30~60秒看看是否出现login或者kernel log
-如果一直黑屏(大概率)这是Alma9 没启用 serial console,非常常见
-
-
-
-不要关闭当前 console,另开ssh
-执行virsh list --all
-
-
-
-为什么第一次不推荐 virtio？（企业经验）
-因为 VMware → KVM 第一次启动
-目标：先成功启动，不是追求性能
-后面稳定后再改：
-virtio-scsi
-virtio-net
-
 创建后查看VM(重点)
-virsh list --all
+rambo@debian1:~$ virsh list --all
+ Id   Name             State
+--------------------------------
+ 1    alma9            running
+ 3    ubuntu24-clone   running
 
 启动VM
-virsh start alma9
+rambo@debian1:~$ virsh start ubuntu24-clone
 
 进入控制台（重点）
-virsh console alma9
+rambo@debian1:~$ virsh console ubuntu24-clone
 退出 Ctrl + ]
 
-
-
-截止到现在完成的已经不是"安装KVM"
-
-而是企业级 VMware → KVM 迁移链路
-包括：
-✅ snapshot
-✅ clone
-✅ vmdk
-✅ qcow2
-✅ virt-install
-✅ virtio
-✅ dracut
-✅ initramfs
-✅ grub
-✅ EFI
-✅ network migration
-✅ libvirt
 
 ```
 
