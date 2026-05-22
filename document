@@ -1,3 +1,73 @@
+1、项目背景
+```shell
+
+2025-2026 年后VMware 被 Broadcom 收购后很多中小企业开始面临：
+授权费用上涨
+免费 ESXi 政策变化
+Workstation 使用受限
+vCenter 成本越来越高
+
+因此越来越多企业开始寻找低成本虚拟化替代方案
+其中KVM + QEMU + libvirt 已经成为Linux 世界事实上的标准虚拟化方案。
+
+
+本项目目标：
+在 Debian12 上部署 KVM/libvirt 并将 VMware Workstation17Pro 的 Linux VM迁移到KVM/QEMU环境
+
+本次迁移不是"新安装 Linux VM",而是真正的 VMware → KVM 企业迁移
+因此会涉及：
+VMware 快照链
+VMDK consolidate
+QCOW2 转换
+libvirt
+virt-install
+BIOS/UEFI
+dracut/initramfs
+virtio 驱动
+KVM 网络
+qemu:///system
+rescue 修复
+等企业级问题
+
+
+2026年生产环境宿主机更推荐Debian12,不推荐Ubuntu24 Desktop
+尤其以下生态：
+OpenStack
+Ceph
+KubeVirt
+libvirt
+
+很多人误以为KVM = 虚拟机
+实际上KVM只是Linux Kernel Virtual Machine
+真正架构：
+virt-manager
+    ↓
+virt-install
+    ↓
+libvirt
+    ↓
+QEMU
+    ↓
+KVM(kernel)
+    ↓
+CPU VT-x / AMD-V
+
+# 各组件作用
+组件		作用
+KVM		内核级虚拟化
+QEMU		虚拟硬件模拟
+libvirt	VM 	管理层
+virsh		CLI管理工具
+virt-install	创建VM
+virt-manager	GUI管理器
+
+```
+
+
+
+
+
+
 # 前奏
 ```shell
 本次是围绕VMware Workstation → KVM/Qemu 迁移实验
@@ -50,6 +120,22 @@ virtio-net
 5、Windows 驱动
 这是最容易翻车的
 比如：蓝屏、INACCESSIBLE_BOOT_DEVICE
+
+6、VMware 快照链问题(重点)
+很多人直接 qemu-img convert
+结果磁盘损坏, 原因是VMware使用Snapshot Chain
+
+例如：
+base.vmdk
+    ↓
+000001.vmdk
+    ↓
+000002.vmdk
+
+真正数据可能在最后 delta disk
+
+
+
 
 ```
 
@@ -130,6 +216,7 @@ deb https://mirrors.ustc.edu.cn/debian/ bookworm-backports main non-free non-fre
 deb-src https://mirrors.ustc.edu.cn/debian/ bookworm-backports main non-free non-free-firmware contrib
 
 
+# 检查CPU虚拟化
 rambo@debian1:~$ egrep -c '(vmx|svm)' /proc/cpuinfo
 输出> 0即可，比如16则说明支持
 
@@ -425,6 +512,14 @@ rambo@e8bit:~/v_machine/alma9-1-bak$ vmware-vdiskmanager -r alma9-1.vmdk -t 0 al
 -r: read source disk
 -t 0 创建 single growable virtual disk, 也就是单一完整VMDK
 这个过程会自动读取 snapshot chain, 也就是说即使 -000001.vmdk 存在，它也会合并最终状态，这其实就是命令行 Full Clone
+完整克隆的作用可以自动合并所有快照链，并生成单一VMDK
+推荐完整克隆的原因是因为：
+安全
+不破坏原VM
+不需要手工找 parentFileNameHint
+企业最常用
+
+
 以下是回显：
 Creating disk 'alma9-1-clone.vmdk'
   Convert: 100% done.
