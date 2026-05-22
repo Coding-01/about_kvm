@@ -1,0 +1,955 @@
+# 前奏
+```shell
+本次是围绕VMware Workstation → KVM/Qemu 迁移实验
+将包含以下几个核心点，专攻单机虚拟化迁移：
+磁盘转换
+virtio
+网络桥接
+Windows 蓝屏
+驱动问题
+性能调优
+
+
+企业长期路线选 Debian12 (主力，本次也将在该版本上做实验)
+原因 稳、KVM 非常成熟、libvirt稳定、系统干净、企业味道重、Proxmox本质也是Debian
+在debian上会安装QEMU、KVM、libvirt、virt-manager
+
+
+学习兼容性路线选 Ubuntu
+Ubuntu更适合：桌面、AI、新硬件
+但KVM企业味不如 Debian，且Ubuntu经常：snap、自动更新、奇怪依赖，对生产思维不太友好
+
+
+```
+
+
+
+
+
+# 第一阶段必须掌握的东西
+```shell
+1、qemu-img (最核心)
+比如磁盘转换，这是企业迁移核心：
+qemu-img info xxx.vmdk
+qemu-img convert -p -f vmdk test.vmdk -O qcow2 test.qcow2
+
+2、virtio (重中之重)
+企业性能核心
+包括：
+virtio-blk
+virtio-scsi
+virtio-net
+
+3、bridge网络
+企业里基本不用NAT
+所以必须会：br0桥接
+
+4、UEFI/BIOS
+很多迁移失败，就是启动模式不一致
+
+5、Windows 驱动
+这是最容易翻车的
+比如：蓝屏、INACCESSIBLE_BOOT_DEVICE
+
+```
+
+
+
+
+# 最优学习路线
+
+```shell
+第一阶段
+单机：
+VMware Workstation → KVM
+掌握：
+qemu-img
+virtio
+bridge
+BIOS/UEFI
+Windows 驱动
+
+第二阶段上Proxmox
+因为这是企业最容易成交的方案
+
+第三阶段
+研究：
+live migration
+Ceph
+HA
+SR-IOV
+GPU passthrough
+
+开始进入高端领域
+
+
+```
+
+
+
+
+
+# 实施
+## 在Debian12上安装kvm环境
+```shell
+1、BIOS必须开启虚拟化
+进入BIOS：
+Intel：
+    VT-x
+    VT-d
+
+AMD：
+    SVM
+    IOMMU
+
+否则会报错：KVM acceleration can NOT be used
+
+
+
+本次实验在vmware workstation17pro中的debian12上，网卡是NAT模式
+
+
+
+rambo@debian1:~$ cat /etc/apt/sources.list
+deb https://mirrors.aliyun.com/debian/ bookworm main non-free non-free-firmware contrib
+deb-src https://mirrors.aliyun.com/debian/ bookworm main non-free non-free-firmware contrib
+deb https://mirrors.aliyun.com/debian-security/ bookworm-security main
+deb-src https://mirrors.aliyun.com/debian-security/ bookworm-security main
+deb https://mirrors.aliyun.com/debian/ bookworm-updates main non-free non-free-firmware contrib
+deb-src https://mirrors.aliyun.com/debian/ bookworm-updates main non-free non-free-firmware contrib
+deb https://mirrors.aliyun.com/debian/ bookworm-backports main non-free non-free-firmware contrib
+deb-src https://mirrors.aliyun.com/debian/ bookworm-backports main non-free non-free-firmware contrib
+#zhongkeda
+deb https://mirrors.ustc.edu.cn/debian/ bookworm main non-free non-free-firmware contrib
+deb-src https://mirrors.ustc.edu.cn/debian/ bookworm main non-free non-free-firmware contrib
+deb https://mirrors.ustc.edu.cn/debian-security/ bookworm-security main
+deb-src https://mirrors.ustc.edu.cn/debian-security/ bookworm-security main
+deb https://mirrors.ustc.edu.cn/debian/ bookworm-updates main non-free non-free-firmware contrib
+deb-src https://mirrors.ustc.edu.cn/debian/ bookworm-updates main non-free non-free-firmware contrib
+deb https://mirrors.ustc.edu.cn/debian/ bookworm-backports main non-free non-free-firmware contrib
+deb-src https://mirrors.ustc.edu.cn/debian/ bookworm-backports main non-free non-free-firmware contrib
+
+
+rambo@debian1:~$ egrep -c '(vmx|svm)' /proc/cpuinfo
+输出> 0即可，比如16则说明支持
+
+
+先更新系统 (避免后续依赖问题)
+不要跳过
+rambo@debian1:~$ uname -a
+Linux debian1 6.1.0-30-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.1.124-1 (2025-01-12) x86_64 GNU/Linux
+
+rambo@debian1:~$ sudo apt update && sudo apt full-upgrade -y && sudo reboot
+rambo@debian1:~$ uname -a
+Linux debian1 6.1.0-48-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.1.172-1 (2026-05-15) x86_64 GNU/Linux
+
+
+# 安装企业级KVM环境(2026稳定版组合)
+rambo@debian1:~$ sudo apt install -y qemu-system \
+qemu-utils qemu-kvm libvirt-daemon-system \
+libvirt-clients virtinst virt-manager \
+bridge-utils ovmf dnsmasq-base \
+cpu-checker cloud-image-utils
+
+
+# 验证KVM是否正常（重点）
+rambo@debian1:~$ sudo kvm-ok
+INFO: /dev/kvm exists
+KVM acceleration can be used         # 有这一句则说明kvm正常
+
+
+启动libvirt
+rambo@debian1:~$ sudo systemctl enable --now libvirtd
+rambo@debian1:~$ systemctl status libvirtd
+● libvirtd.service - Virtualization daemon
+     Loaded: loaded (/lib/systemd/system/libvirtd.service; enabled; preset: enabled)
+     Active: active (running) since Thu 2026-05-21 06:39:31 EDT; 5s ago
+TriggeredBy: ● libvirtd-admin.socket
+             ● libvirtd.socket
+             ● libvirtd-ro.socket
+       Docs: man:libvirtd(8)
+             https://libvirt.org
+   Main PID: 22551 (libvirtd)
+      Tasks: 19 (limit: 32768)
+     Memory: 13.5M
+        CPU: 514ms
+     CGroup: /system.slice/libvirtd.service
+             └─22551 /usr/sbin/libvirtd --timeout 120
+
+
+
+# 把当前用户加入虚拟化组（避免权限问题）
+virt-manager打不开
+permission denied
+qemu:///system连接失败
+都是这一步没做
+
+rambo@debian1:~$ sudo usermod -aG libvirt $USER && sudo usermod -aG kvm $USER
+
+必须重新登录
+rambo@debian1:~$ sudo reboot
+
+
+验证 libvirt 是否正常（极重要）
+rambo@debian1:~$ virsh list --all
+ Id   Name   State
+--------------------
+
+
+# 检查QEMU版本(避免教程版本不一致)
+rambo@debian1:~$ qemu-system-x86_64 --version
+QEMU emulator version 7.2.22 (Debian 1:7.2+dfsg-7+deb12u18+b2)
+Copyright (c) 2003-2022 Fabrice Bellard and the QEMU Project developers
+
+注意：7.x 是稳定企业版本
+
+
+# 配置libvirt默认网络
+rambo@debian1:~$ virsh net-list --all
+ Name   State   Autostart   Persistent
+----------------------------------------
+
+rambo@debian1:~$ sudo virsh net-define /usr/share/libvirt/networks/default.xml
+注：有可能会报以下提示，这是正常的默认就会有default网络，只是没启动也没有vm接入
+error: Failed to define network from /usr/share/libvirt/networks/default.xml
+error: operation failed: network 'default' already exists with uuid 3b76875e-d749-4cf0-af30-7ee1322e12b7
+
+
+# 启动默认网络
+rambo@debian1:~$ sudo virsh net-start default
+
+# 设置开机自启
+rambo@debian1:~$ sudo virsh net-autostart default
+
+rambo@debian1:~$ virsh net-list --all
+ Name   State   Autostart   Persistent
+----------------------------------------        # 还没有KVM VM接入所以没显示default网络
+
+rambo@debian1:~$ ip a
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000
+    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+    inet 127.0.0.1/8 scope host lo
+       valid_lft forever preferred_lft forever
+    inet6 ::1/128 scope host noprefixroute 
+       valid_lft forever preferred_lft forever
+2: ens33: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP group default qlen 1000
+    link/ether 00:0c:29:47:1b:d2 brd ff:ff:ff:ff:ff:ff
+    altname enp2s1
+    inet 172.16.186.194/24 brd 172.16.186.255 scope global dynamic ens33
+       valid_lft 1226sec preferred_lft 1226sec
+7: virbr0: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500 qdisc noqueue state DOWN group default qlen 1000
+    link/ether 52:54:00:9f:da:2d brd ff:ff:ff:ff:ff:ff
+    inet 192.168.122.1/24 brd 192.168.122.255 scope global virbr0
+       valid_lft forever preferred_lft forever
+
+
+真正结构就正确了
+Windows/mint21(物理机)
+   ↓
+VMware NAT
+   ↓
+Debian12 ens33
+   ↓
+libvirt virbr0
+   ↓
+KVM VM
+
+为什么这个方案正确？
+因为libvirt 的 virbr0是 NAT bridge
+不需要:
+promiscuous mode
+二层直通
+VMware bridge
+
+所以不会再触发 VMware 网卡的混杂模式(安全限制)
+
+
+
+马上会开始接触：
+qcow2
+virtio
+UEFI
+libvirt XML
+vCPU
+cloud-init
+
+这些才是企业迁移核心
+
+
+```
+
+
+
+
+
+
+## 迁移第一个Bios类型的Linux KVM VM
+```shell
+因为我的vmware workstation17pro上就有linux的vm, 所以我直接开始做迁移
+迁移本质是什么？（第一性原理）
+其实VMware VM 本质就是 vmdk + vmx
+而KVM VM本质就是 qcow2/raw + xml
+
+所以迁移核心其实只有磁盘格式转换
+
+关于快照有2种情况：
+第一种是我不保留任何快照，把所有快照都删除，只留base.vmdk，这个就不讲了，自行删除快照即可
+第二种是完整克隆这台虚拟机，完整克隆会把所有快照合并到一个vmdk里面，这样实现快照合并的效果
+
+
+
+现在先找 VMware VM 的 vmdk 文件（重点）
+在VMware Workstation找到你的VM目录
+
+
+重点：确认是哪种vmdk(非常重要)很多人这里翻车
+rambo@bit:~/v_machine/alma9-1-new$ qemu-img info alma9-1-cl1.vmdk 
+image: alma9-1-cl1.vmdk
+file format: vmdk
+virtual size: 80 GiB (85899345920 bytes)
+disk size: 3.95 GiB
+cluster_size: 65536
+Format specific information:
+    cid: 538008812
+    parent cid: 4294967295
+    create type: monolithicSparse
+    extents:
+        [0]:
+            virtual size: 85899345920
+            filename: alma9-1-cl1.vmdk
+            cluster size: 65536
+            format: 
+如果create type 是 monolithicSparse最好
+如果create type 是 twoGbMaxExtentSparse，说明分片VMDK，也能转但更容易踩坑
+
+最稳做法(推荐)
+先关机 VMware VM
+不要 suspend
+不要 snapshot
+不建议直接迁移带快照链的VM，正确做法是先删除/合并快照(Consolidate)再迁移
+因为VMware snapshot本质不是"完整备份"而是差异磁盘链
+base.vmdk
+base-000001.vmdk
+base-000002.vmdk
+
+实际上最新数据可能在最后一个delta文件里
+很多人为什么迁移后数据丢失？
+因为他们只转了base.vmdk 没转 -00000x.vmdk
+结果VM启动了但数据回到了旧状态,这是企业真实事故
+
+# 合并快照(来到实体机的vm目录下)
+rambo@e8bit:~/v_machine/alma9-1$ ls -alh
+总计 8.8G
+drwxrwxr-x  4 rambo rambo 4.0K  5月 21 21:57 .
+drwxr-xr-x 42 rambo rambo 4.0K  5月 20 18:10 ..
+-rw-------  1 rambo rambo 109M  6月  8  2025 alma9-1-000001.vmdk
+-rw-------  1 rambo rambo 169M  6月  8  2025 alma9-1-000002.vmdk
+-rw-------  1 rambo rambo  36M  6月  8  2025 alma9-1-000003.vmdk
+-rw-------  1 rambo rambo 1.3G  1月 16 16:06 alma9-1-000005.vmdk
+-rw-rw-rw-  1 rambo rambo 7.4K 12月  9 17:52 alma9-1-0.scoreboard
+-rw-------  1 rambo rambo 6.5M  5月 20 17:06 alma9-1-0.vmdk
+-rw-rw-rw-  1 rambo rambo 7.4K 12月  8 19:42 alma9-1-1.scoreboard
+-rw-------  1 rambo rambo 1.6M  5月 20 17:06 alma9-1-1.vmdk
+-rw-rw-rw-  1 rambo rambo 7.4K 12月  7 16:52 alma9-1-2.scoreboard
+-rw-------  1 rambo rambo 1.4M  5月 20 17:06 alma9-1-2.vmdk
+-rw-------  1 rambo rambo 1.4M  5月 20 17:06 alma9-1-3.vmdk
+-rw-------  1 rambo rambo 1.4M  6月  8  2025 alma9-1-4-000001.vmdk
+-rw-------  1 rambo rambo 1.6M  6月  8  2025 alma9-1-4-000002.vmdk
+-rw-------  1 rambo rambo 3.9G  6月  8  2025 alma9-1-4.vmdk
+-rw-------  1 rambo rambo 1.4M  6月  8  2025 alma9-1-5-000001.vmdk
+-rw-------  1 rambo rambo 1.5M  6月  8  2025 alma9-1-5-000002.vmdk
+-rw-------  1 rambo rambo 202M  6月  8  2025 alma9-1-5.vmdk
+-rw-------  1 rambo rambo 1.4M  6月  8  2025 alma9-1-6-000001.vmdk
+-rw-------  1 rambo rambo 1.5M  6月  8  2025 alma9-1-6-000002.vmdk
+-rw-------  1 rambo rambo 1.4M  6月  8  2025 alma9-1-6.vmdk
+-rw-------  1 rambo rambo 1.4M  6月  8  2025 alma9-1-7-000001.vmdk
+-rw-------  1 rambo rambo 1.4M  6月  8  2025 alma9-1-7-000002.vmdk
+-rw-------  1 rambo rambo 1.4M  6月  8  2025 alma9-1-7.vmdk
+-rw-------  1 rambo rambo 8.5K  1月 16 15:48 alma9-1.nvram
+-rw-rw-rw-  1 rambo rambo 7.4K  1月 16 16:06 alma9-1.scoreboard
+-rw-------  1 rambo rambo  29K  2月  3  2025 alma9-1-Snapshot1.vmsn
+-rw-------  1 rambo rambo  29K  6月  8  2025 alma9-1-Snapshot3.vmsn
+-rw-------  1 rambo rambo  29K  6月  8  2025 alma9-1-Snapshot4.vmsn
+-rw-------  1 rambo rambo  29K  6月  8  2025 alma9-1-Snapshot5.vmsn
+-rw-------  1 rambo rambo 3.2G  2月  3  2025 alma9-1.vmdk
+-rw-r--r--  1 rambo rambo 2.5K  6月 18  2025 alma9-1.vmsd
+-rwx------  1 rambo rambo 3.5K  1月 16 16:06 alma9-1.vmx
+-rw-------  1 rambo rambo  262  1月 16 15:48 alma9-1.vmxf
+drwxrwxrwx  2 rambo rambo 4.0K  5月 21 21:57 alma9-1.vmx.lck
+drwxrwxr-x  2 rambo rambo 4.0K  2月  3  2025 mksSandbox
+-rw-r-----  1 rambo rambo  53K 12月  9 17:52 mksSandbox-0.log
+-rw-r-----  1 rambo rambo  55K 12月  8 19:42 mksSandbox-1.log
+-rw-r-----  1 rambo rambo  53K 12月  7 16:52 mksSandbox-2.log
+-rw-r-----  1 rambo rambo  53K  1月 16 16:06 mksSandbox.log
+-rw-------  1 rambo rambo 211K 12月  9 17:52 vmware-0.log
+-rw-------  1 rambo rambo 256K 12月  8 19:42 vmware-1.log
+-rw-------  1 rambo rambo 200K 12月  7 16:52 vmware-2.log
+-rw-------  1 rambo rambo 200K  1月 16 16:06 vmware.log
+
+这个目录实际上已经是标准"企业真实生产 VM" 状态
+因为这里不是简单单盘，而是 多磁盘 + 多快照链
+这已经非常接近企业VMware环境
+
+这个VM当前状态（重点分析）
+这里最关键的是说明主系统盘存在 snapshot chain
+alma9-1-000001.vmdk
+alma9-1-000002.vmdk
+alma9-1-000003.vmdk
+alma9-1-000005.vmdk
+
+而以下这些是额外数据盘，企业里很常见
+alma9-1-0.vmdk
+alma9-1-1.vmdk
+alma9-1-2.vmdk
+
+
+
+命令完整克隆
+rambo@e8bit:~/v_machine$ cp -ar alma9-1  alma9-1-bak      # 完整复制vm
+rambo@e8bit:~/v_machine$ cd alma9-1-bak
+rambo@e8bit:~/v_machine/alma9-1-bak$ 
+Linux版 Workstation 自带 vmware-vdiskmanager 这才是企业真正会用的
+先确认是否存在
+rambo@e8bit:~/v_machine/alma9-1-bak$ which vmware-vdiskmanager
+正常会在 /usr/bin/vmware-vdiskmanager
+该工具可以：
+✅ clone
+✅ merge snapshot
+✅ expand disk
+✅ shrink disk
+✅ convert disk
+
+执行 Full Clone
+rambo@e8bit:~/v_machine/alma9-1-bak$ vmware-vdiskmanager -r alma9-1.vmdk -t 0 alma9-1-clone.vmdk
+命令释义：
+-r: read source disk
+-t 0 创建 single growable virtual disk, 也就是单一完整VMDK
+这个过程会自动读取 snapshot chain, 也就是说即使 -000001.vmdk 存在，它也会合并最终状态，这其实就是命令行 Full Clone
+以下是回显：
+Creating disk 'alma9-1-clone.vmdk'
+  Convert: 100% done.
+Virtual disk conversion successful.            # 说明snapshot chain已经被正确读取
+
+
+rambo@e8bit:~/v_machine/alma9-1-bak$ ls -alh alma9-1-clone.vmdk 
+-rw------- 1 rambo rambo 3.2G  5月 21 22:50 alma9-1-clone.vmdk
+注意：它已经是完整磁盘
+
+然后验证 clone（非常重要）
+rambo@e8bit:~/v_machine/alma9-1-bak$ qemu-img info alma9-1-clone.vmdk 
+image: alma9-1-clone.vmdk
+file format: vmdk
+virtual size: 80 GiB (85899345920 bytes)
+disk size: 3.18 GiB
+cluster_size: 65536
+Format specific information:
+    cid: 2098440624
+    parent cid: 4294967295                   #  即现在已经是独立完整磁盘
+    create type: monolithicSparse            # 这是qemu-img 最喜欢的 VMware 格式
+    extents:
+        [0]:
+            virtual size: 85899345920
+            filename: alma9-1-clone.vmdk
+            cluster size: 65536
+            format: 
+注意：理想情况(重点)会看到不再有backing file
+我这个 clone已经没有加密限制
+因为如果vmdk encryption 仍然有效，这里执行 qemu-img info通常会失败
+很可能我加密的是VM 配置层，而不是VMDK data layer
+
+
+所以我现在已经具备真正迁移条件下一步(核心),现在转 qcow2
+在实体机上把 alma9-1-clone.vmdk 传到debian12上
+企业习惯是放在/var/lib/libvirt/images/
+rambo@bit:~/v_machine/alma9-1-bak$ scp alma9-1-clone.vmdk rambo@172.16.186.194:~
+
+在Debian12上再移动一回，因为从实体机上直接发过来没权限直接到/var/lib/libvirt/images/
+rambo@debian1:~$ sudo cp alma9-1-clone.vmdk  /var/lib/libvirt/images/             # 这是kvm的标准目录
+rambo@debian1:/var/lib/libvirt/images$ sudo ls -alh
+total 3.2G
+-rw------- 1 root root 3.2G May 21 09:40 alma9-1-clone.vmdk
+
+
+在 Debian12上正式转换（重点）
+rambo@debian1:~$ cd /var/lib/libvirt/images/
+rambo@debian1:/var/lib/libvirt/images$ sudo qemu-img convert \
+-p \
+-f vmdk alma9-1-clone.vmdk \
+-O qcow2 alma9-1.qcow2
+    (100.00/100%)           # 该行是回显
+
+rambo@debian1:/var/lib/libvirt/images$ sudo ls -alh
+total 6.4G
+drwx--x--x 2 root root 4.0K May 21 09:41 .
+drwxr-xr-x 7 root root 4.0K May 21 07:24 ..
+-rw------- 1 root root 3.2G May 21 09:40 alma9-1-clone.vmdk
+-rw-r--r-- 1 root root 3.2G May 21 09:42 alma9-1.qcow2
+
+转换完成后检查(重要)
+rambo@debian1:/var/lib/libvirt/images$ qemu-img info alma9-1.qcow2
+image: alma9-1.qcow2
+file format: qcow2                   # 格式已经更换
+virtual size: 80 GiB (85899345920 bytes)
+disk size: 3.18 GiB
+cluster_size: 65536
+Format specific information:
+    compat: 1.1
+    compression type: zlib
+    lazy refcounts: false
+    refcount bits: 16
+    corrupt: false
+    extended l2: false
+
+
+
+
+
+这里其实已经完成企业迁移最核心部分，下一步才是真正KVM启动验证
+
+
+
+# 查看原虚拟机的配置
+rambo@bit:~/v_machine/alma9-1-bak$ cat alma9-1.vmx
+#!/usr/bin/vmware
+.encoding = "UTF-8"
+displayName = "alma9-1"
+config.version = "8"
+virtualHW.version = "21"
+mks.enable3d = "TRUE"
+pciBridge0.present = "TRUE"
+pciBridge4.present = "TRUE"
+pciBridge4.virtualDev = "pcieRootPort"
+pciBridge4.functions = "8"
+pciBridge5.present = "TRUE"
+pciBridge5.virtualDev = "pcieRootPort"
+pciBridge5.functions = "8"
+pciBridge6.present = "TRUE"
+pciBridge6.virtualDev = "pcieRootPort"
+pciBridge6.functions = "8"
+pciBridge7.present = "TRUE"
+pciBridge7.virtualDev = "pcieRootPort"
+pciBridge7.functions = "8"
+vmci0.present = "TRUE"
+hpet0.present = "TRUE"
+nvram = "alma9-1.nvram"
+virtualHW.productCompatibility = "hosted"
+powerType.powerOff = "soft"
+powerType.powerOn = "soft"
+powerType.suspend = "soft"
+powerType.reset = "soft"
+guestOS = "almalinux-64"
+tools.syncTime = "FALSE"
+sound.autoDetect = "TRUE"
+sound.fileName = "-1"
+sound.present = "TRUE"
+numvcpus = "2"
+cpuid.coresPerSocket = "1"
+vcpu.hotadd = "TRUE"
+memsize = "4096"
+mem.hotadd = "TRUE"
+nvme0.present = "TRUE"
+nvme0:0.fileName = "alma9-1-000005.vmdk"         # 磁盘类型是nvme，这里要注意
+nvme0:0.present = "TRUE"
+ide1:0.deviceType = "cdrom-image"
+ide1:0.fileName = "/home/rambo/下载/iso/AlmaLinux-9.5-x86_64-dvd.iso"
+ide1:0.present = "TRUE"
+usb.present = "TRUE"
+svga.graphicsMemoryKB = "8388608"
+ethernet0.connectionType = "nat"
+ethernet0.addressType = "generated"
+ethernet0.virtualDev = "vmxnet3"                 # 这里要注意，kvm中没有net3这个网络
+ethernet0.present = "TRUE"
+extendedConfigFile = "alma9-1.vmxf"
+floppy0.present = "FALSE"
+vmxstats.filename = "alma9-1.scoreboard"
+uuid.bios = "56 4d ae ad 77 e5 46 4d-1b 4d d5 86 95 38 af 92"
+uuid.location = "56 4d dc 5c a3 f1 04 5f-c7 c5 61 8e db 2a 9a 03"
+pciBridge0.pciSlotNumber = "17"
+pciBridge4.pciSlotNumber = "21"
+pciBridge5.pciSlotNumber = "22"
+pciBridge6.pciSlotNumber = "23"
+pciBridge7.pciSlotNumber = "24"
+usb.pciSlotNumber = "32"
+ethernet0.pciSlotNumber = "160"
+sound.pciSlotNumber = "33"
+nvme0.pciSlotNumber = "192"
+nvme0:0.redo = ""
+svga.vramSize = "268435456"
+vmotion.checkpointFBSize = "4194304"
+vmotion.checkpointSVGAPrimarySize = "268435456"
+vmotion.svga.mobMaxSize = "1073741824"
+vmotion.svga.graphicsMemoryKB = "8388608"
+vmotion.svga.supports3D = "1"
+vmotion.svga.baseCapsLevel = "9"
+vmotion.svga.maxPointSize = "189"
+vmotion.svga.maxTextureSize = "16384"
+vmotion.svga.maxVolumeExtent = "2048"
+vmotion.svga.maxTextureAnisotropy = "16"
+vmotion.svga.lineStipple = "1"
+vmotion.svga.dxMaxConstantBuffers = "15"
+vmotion.svga.dxProvokingVertex = "1"
+vmotion.svga.sm41 = "1"
+vmotion.svga.multisample2x = "1"
+vmotion.svga.multisample4x = "1"
+vmotion.svga.msFullQuality = "1"
+vmotion.svga.logicOps = "1"
+vmotion.svga.bc67 = "9"
+vmotion.svga.sm5 = "1"
+vmotion.svga.multisample8x = "1"
+vmotion.svga.logicBlendOps = "1"
+vmotion.svga.maxForcedSampleCount = "16"
+vmotion.svga.gl43 = "1"
+ethernet0.generatedAddress = "00:0c:29:38:af:92"
+ethernet0.generatedAddressOffset = "0"
+vmci0.id = "-1791447150"
+nvme0.subnqnUUID = "52 71 29 79 8a a5 76 b0-16 fd 76 5a d6 f5 b8 0a"
+monitor.phys_bits_used = "45"
+cleanShutdown = "TRUE"
+softPowerOff = "TRUE"
+usb:1.speed = "2"
+usb:1.present = "TRUE"
+usb:1.deviceType = "hub"
+usb:1.port = "1"
+usb:1.parent = "-1"
+svga.guestBackedPrimaryAware = "TRUE"
+tools.capability.verifiedSamlToken = "TRUE"
+guestInfo.detailed.data = "architecture='X86' bitness='64' cpeString='cpe:/o:almalinux:almalinux:9::baseos' distroAddlVersion='9.5 (Teal Serval)' distroName='AlmaLinux' distroVersion='9.5' familyName='Linux' kernelVersion='5.14.0-503.22.1.el9_5.x86_64' prettyName='AlmaLinux 9.5 (Teal Serval)'"
+usb:0.present = "TRUE"
+usb:0.deviceType = "hid"
+usb:0.port = "0"
+usb:0.parent = "-1"
+
+
+
+
+在Debian12上先确认是否安装了, 如无则安装 sudo apt install virtinst -y
+rambo@debian1:/var/lib/libvirt/images$ which virt-install
+/usr/bin/virt-install
+
+
+开始真正创建VM(核心)
+rambo@debian1:/var/lib/libvirt/images$ cd
+rambo@debian1:~$ sudo virt-install \
+--name alma9 \
+--memory 4096 \
+--vcpus 2 \
+--cpu host-passthrough \
+--disk /var/lib/libvirt/images/alma9-1.qcow2,format=qcow2,bus=virtio \
+--network network=default,model=virtio \
+--os-variant almalinux9 \
+--import \
+--graphics none
+
+
+不要关闭当前 console,另开ssh
+执行virsh list --all
+
+
+迁移前注意存储控制器变化
+VMware → KVM
+注意原vmdk磁盘格式，用 virtio-blk 或者 nvme，最稳的是virtio，因为Alma9内核默认支持
+因为原VM不是SATA，所以启动虚拟机时要用bus=virtio,原因是KVM 的 NVMe兼容性不如 virtio 稳，对于新启动时企业里90% Linux KVM VM 都是virtio，因为这种性能和兼容性都是最好。但原vm是用的nvme的磁盘
+KVM没有 vmxnet3所以我们必须用virtio-net
+VMware虚拟磁盘控制器常见类型：(重点)scsi0: 、sata0: ide0: 、nvme0:
+
+如报错：Disk /var/lib/libvirt/images/alma9-1.qcow2 is already in use by other guests ['alma9']. (Use --check path_in_use=off or --check all=off to override)
+解决：
+rambo@debian1:~$ virsh list --all
+rambo@debian1:~$ virsh list --all --inactive
+注: 应该都为空, 因为现在启动新vm时报错了
+
+rambo@debian1:~$ virsh undefine alma9
+rambo@debian1:~$ virsh dumpxml alma9
+rambo@debian1:~$ sudo ls /etc/libvirt/qemu/      # 如有alma9.xml就删除
+rambo@debian1:~$ sudo virsh undefine alma9
+
+如果还是删不掉(少见)
+直接 sudo rm -f /etc/libvirt/qemu/alma9.xml
+然后 sudo systemctl restart libvirtd
+查qemu进程
+ps -ef | grep qemu
+如果看到qemu-system-x86_64则说明残留VM进程还在
+sudo kill -9 pid号
+
+# 如还报错则查看日志
+rambo@debian1:~$ sudo ls -alh /var/log/libvirt/qemu/           # 应该能看到 alma9.log
+rambo@debian1:~$ sudo tail -50 /var/log/libvirt/qemu/alma9.log
+
+
+
+
+下述图片中的这个dracut-initqueue timeout报错本质就是initramfs 里没有 virtio 磁盘驱动
+
+导致的原因释义：
+现在的状态(重点)
+GRUB：✅ 正常
+kernel：✅ 正常加载
+但找不到 root filesystem，是因为原VMware用的是NVMe controller
+现在KVM用的是virtio-blk
+但 initramfs 里仍然只有 VMware/NVMe 驱动，没有virtio_blk。
+所以系统启动到 dracut-initqueue，开始疯狂等待/dev/disk/by-uuid
+但磁盘根本识别不出来，于是timeout，这就是企业迁移里最经典问题
+尤其VMware → KVM/OpenStack
+
+```
+![image](./images/1.png)
+![image](./images/2.png)
+
+```
+# 解决
+先把Alma的 ISO放到 Debian12 的 /var/lib/libvirt/boot/ 中
+
+# 重新挂ISO创建VM(重点)
+rambo@debian1:~$ sudo virt-install \
+--name alma9-fix \
+--memory 4096 \
+--vcpus 2 \
+--cpu host-passthrough \
+--disk /var/lib/libvirt/images/alma9-1.qcow2,format=qcow2,bus=virtio \
+--network network=default,model=virtio \
+--cdrom /var/lib/libvirt/boot/AlmaLinux-9.5-x86_64-dvd.iso \
+--graphics vnc,listen=0.0.0.0
+
+rambo@debian1:~$ sudo ls -alh /var/lib/libvirt/boot/
+-rw-r--r-- 1 root root  11G May 21 11:18 AlmaLinux-9.5-x86_64-dvd.iso
+
+```
+![image](./images/3.png)
+![image](./images/4.png)
+![image](./images/5.png)
+
+<font color=red>**它会自动搜索并挂载Alma9，通常是 /mnt/sysroot 或 /mnt/sysimage**</font>
+![image](./images/6.png)
+![image](./images/7.png)
+<font color=red>**之所以要建议重建grub是因为从VMware NVMe迁移到了KVM virtio**</font>
+<font color=red>**查看磁盘 fdisk -l /dev/vda**</font>
+![image](./images/8.png)
+![image](./images/9.png)
+![image](./images/10.png)
+
+
+
+```shell
+# 清理上述的错误环境
+rambo@debian1:~$ ps -ef | grep qemu
+注: 确保没有qemu-system-x86_64进程
+
+rambo@debian1:~$ virsh list --all
+ Id   Name   State
+--------------------
+注: 确保为空
+
+rambo@debian1:~$ sudo ls /etc/libvirt/qemu/
+alma9-fix.xml  networks
+rambo@debian1:~$ sudo rm -rf /etc/libvirt/qemu/alma9-fix.xml             # 把原来关于alma9的xml删掉
+rambo@debian1:~$ sudo virsh undefine alma9
+
+
+libvirt其实有两套,所以需要确定当前默认使用的哪种
+rambo@debian1:~$ virsh uri
+qemu:///session
+
+1、session mode(普通用户)
+qemu:///session
+VM运行在 ~/.config/libvirt/
+有时候默认session mode
+所以很多人会遇到VM明明启动了virsh list 却是空的
+session mode：
+网络能力弱
+bridge麻烦
+权限问题多
+VM跟随用户登录
+systemd控制差
+
+2、system mode（企业生产）
+qemu:///system
+VM运行在/etc/libvirt/
+
+企业里必须用 qemu:///system
+因为针对以下项都更完整:
+systemd管理
+bridge/network
+storage pool
+autostart
+权限
+vhost-net
+
+
+因为默认使用的是qemu:///session(用户模式)，而企业环境里应该默认用qemu:///system，修改如下:
+rambo@debian1:~$ echo 'export LIBVIRT_DEFAULT_URI=qemu:///system' | sudo tee -a ~/.bashrc
+rambo@debian1:~$ source ~/.bashrc
+
+# 更底层的方法
+rambo@debian1:~$ sudo vim /etc/libvirt/libvirt.conf
+uri_default = "qemu:///system"
+
+rambo@debian1:~$ sudo systemctl restart libvirtd
+
+
+# 再验证
+rambo@debian1:~$ virsh uri
+qemu:///system
+这一步完成后以下项默认都会走 system mode：
+virsh
+virt-install
+virt-manager
+virt-clone
+virt-viewer
+
+
+# 把光盘去掉不进rescue模式来重新启动新的vm
+rambo@debian1:~$ sudo virt-install \
+--name alma9 \
+--memory 4096 \
+--vcpus 2 \
+--cpu host-passthrough \
+--disk /var/lib/libvirt/images/alma9-1.qcow2,format=qcow2,bus=virtio \
+--network network=default,model=virtio \
+--os-variant almalinux9 \
+--import \
+--graphics vnc
+
+
+# 启动虚拟机
+rambo@debian1:~$ virsh start alma9
+
+
+#============================================================
+# 如果遇到明明vm已经正常启动了，但就是查不到时
+rambo@debian1:~$ virsh list --all
+ Id   Name   State
+--------------------
+
+rambo@debian1:~$ virsh uri
+qemu:///session
+问题在于现在查看的是用户级libvirt，不是系统级
+而启动的vm大概率在qemu:///session
+
+rambo@debian1:~$ sudo virsh -c qemu:///session list --all
+ Id   Name    State
+-----------------------
+ 1    alma9   running
+
+原因分析:
+libvirt其实有两套：
+
+1、session mode(普通用户)
+qemu:///session
+VM运行在 ~/.config/libvirt/
+有时候默认session mode
+所以很多人会遇到VM明明启动了virsh list 却是空的
+session mode：
+网络能力弱
+bridge麻烦
+权限问题多
+VM跟随用户登录
+systemd控制差
+
+2、system mode（企业生产）
+qemu:///system
+VM运行在/etc/libvirt/
+
+企业里必须用 qemu:///system
+因为针对以下项都更完整:
+systemd管理
+bridge/network
+storage pool
+autostart
+权限
+vhost-net
+
+#============================================================
+
+```
+
+
+
+
+
+
+
+## KVM正确EFI启动方式(重点)
+```shell
+必须OVMF,OVMF简单说
+QEMU/KVM 的 UEFI firmware, 相当于虚拟版UEFI BIOS
+Debian12安装(重要) sudo apt install ovmf -y
+# 确认文件存在
+ls /usr/share/OVMF/        # 正常应有如下2个文件
+OVMF_CODE.fd
+OVMF_VARS.fd
+
+EFI VM正确创建方式(重点)
+sudo virt-install \
+--name alma9 \
+--memory 4096 \
+--vcpus 2 \
+--cpu host-passthrough \
+--disk /var/lib/libvirt/images/alma9.qcow2,format=qcow2,bus=virtio \
+--network network=default,model=virtio \
+--os-variant almalinux9 \
+--boot uefi \         # 重点，libvirt会自动加载OVMF
+--import \
+--graphics none
+
+# ===================================================
+企业里最常见报错：
+No boot device
+其实80% 是 EFI/BIOS 不一致
+企业虚拟化迁移真正难的地方不是qemu-img
+而是：
+firmware
+controller
+boot chain
+initramfs
+driver
+这些兼容层
+# ===================================================
+
+这条命令到底干了什么?
+--import: 使用现有磁盘且不安装系统
+--disk：指定qcow2
+bus=sata：第一次迁移最稳
+--network network=default：使用 virbr0 NAT
+--graphics none：纯命令行
+--console pty,target_type=serial ：允许 virsh console 进入
+
+以下是回显：
+Starting install...
+Creating domain...                         |    0 B  00:00:00     
+Running text console command: virsh --connect qemu:///system console alma9          # 已经接入串口控制台
+Connected to domain 'alma9'                                                         # libvirt domain已创建成功
+Escape character is ^] (Ctrl + ])
+释义：
+成功创建并启动了第一个KVM迁移VM
+
+这里有个关键点（重要）
+很多VMware Linux VM默认没开启 serial console，所以现在可能是黑屏或没输出
+这不代表启动失败（重点）
+因为现在连接的是serial console不是VGA
+等30~60秒看看是否出现login或者kernel log
+如果一直黑屏(大概率)这是Alma9 没启用 serial console,非常常见
+
+
+
+不要关闭当前 console,另开ssh
+执行virsh list --all
+
+
+
+为什么第一次不推荐 virtio？（企业经验）
+因为 VMware → KVM 第一次启动
+目标：先成功启动，不是追求性能
+后面稳定后再改：
+virtio-scsi
+virtio-net
+
+创建后查看VM(重点)
+virsh list --all
+
+启动VM
+virsh start alma9
+
+进入控制台（重点）
+virsh console alma9
+退出 Ctrl + ]
+
