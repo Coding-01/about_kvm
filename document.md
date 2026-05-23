@@ -1705,6 +1705,26 @@ See https://ubuntu.com/esm or run: sudo pro status
 
 rambo@ub24:~$ 
 
+注: 进来后任意时候想退出都是按 Ctrl + ] 来退出 !!!
+
+# ===============================================
+rambo@debian1:~$ virsh list --all
+ Id   Name             State
+--------------------------------
+ 1    alma9            running
+ 3    ubuntu24-clone   running
+
+# 正常关机
+rambo@debian1:~$ virsh shutdown alma9
+rambo@debian1:~$ virsh shutdown ubuntu24-clone
+
+# 强制关闭虚拟机
+virsh destroy <虚拟机名>
+
+# 删除虚拟机
+virsh  undefine <虚拟机名>
+
+# ===============================================
 
 
 rambo@debian1:~$ sudo netstat -anpt | grep 590
@@ -1875,6 +1895,34 @@ driver
 
 # FAQ
 ```shell
+结合在文档中制定的标准流程与底层设计思路，Linux虚拟机(不论是BIOS引导的CentOS/AlmaLinux 还是EFI引导的Ubuntu)在完成底层vmdk到qcow2转换并拉起后，常会遭遇以下四个方面的故障:
+
+Q1: 虚拟机启动直接卡在 GRUB 命令行提示符，或者 EFI 报错 No bootable device
+根本原因：
+引导模式错配：原VMware虚拟机是BIOS(Legacy)，但在KVM创建时误指定了--boot uefi(反之亦然)
+
+NVMe/SCSI盘符变化引发的GRUB找不到根:
+VMware的标准磁盘挂载节点可能是/dev/nvme0n1p1 或 /dev/sda1，迁移到KVM配置成高性能的VirtIO驱动后，盘符彻底变成了/dev/vda1。GRUB内嵌的硬件UUID或硬编码路径无法识别
+
+解决思路：使用宿主机 guestmount -a /var/lib/libvirt/images/xxx.qcow2 -i /mnt 挂载分析，或者挂载一张Ubuntu/AlmaLinux的系统修复ISO镜像进入救援模式(Rescue Mode)。重新生成GRUB配置文件(Ubuntu: update-grub / 红帽系: grub2-mkconfig -o /boot/efi/EFI/almalinux/grub.cfg)，并重写引导扇区(BIOS机器执行 grub-install /dev/vda)
+
+Q2: 启动时卡在进度条，或者跌入 initramfs / dracut 紧急Shell
+根本原因:
+在文档中重点处理了 dracut --force，这正是一步到位的核心痛点。原VMware内核镜像(initramfs/initrd)在封装时只打包了 mpt3sas 或 nvme 驱动，没有将KVM所需的 virtio、virtio_blk、virtio_pci 驱动打包进去。系统在挂载根文件系统时"瞎了"，找不到硬驱
+解决思路：
+红帽系(AlmaLinux/Rocky/CentOS): 挂载救援模式，强制重构：dracut --with-modifiers "virtio virtio_blk virtio_pci virtio_net" --force /boot/initramfs-$(uname -r).img $(uname -r)
+Debian/Ubuntu系：向 /etc/initramfs-tools/modules 追加 virtio 相关驱动名，执行 update-initramfs -u -k all
+
+Q3: 虚拟机可以启动，但在控制台狂刷 cloud-init 或网络超时错误，且无法连网
+根本原因：底层网卡硬件发生变动。VMware默认使用e1000e或vmxnet3，其总线地址和 MAC 地址在KVM下发生了质变。Ubuntu的netplan或红帽系的NetworkManager依然在尝试寻找旧的 ens33 或 eth0，对KVM新给的enp1s0(VirtIO)视而不见
+解决思路:
+修改网络配置(/etc/netplan/*.yaml 或 /etc/NetworkManager/system-connections/)，将旧网卡名字替换为 ip a 查看到的最新物理网卡名
+
+Q4: EFI迁移后，虽然配置了 --boot uefi，但仍进入了EFI Shell
+根本原因：VMware和KVM的NVRAM引导变量不共享。KVM内置的OVMF固件没有原VMware引导文件的NVRAM记录，不知道该去读取哪个 .efi 文件
+解决思路：在EFI Shell提示符下，手动通过 fs0: 进入EFI分区，找到 EFI/ubuntu/grubx64.efi 或 EFI/almalinux/shimx64.efi 手动引导系统；
+进入系统后，必须立刻执行 grub-install 或 efibootmgr 重新将当前的引导路径强制写入 KVM 的 OVMF 虚拟 NVRAM 中
+
 
 
 
