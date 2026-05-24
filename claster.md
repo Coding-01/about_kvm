@@ -369,11 +369,11 @@ crw-rw-rw- 1 root root 119, 8  5月 23 05:20 /dev/vmnet8
 
 
 
-# 迁移
+# 迁移Linux
 ## 迁移前奏
 ```shell
 不同的客户情况不同，必须掌握以下两种手段：
-流派A: 降维打击 --- PVE 8.x 官方原生API抽干(首选，最赚钱)
+流派A: 用PVE8.x官方原生API抽干(首选)
 这是 Proxmox 官方近年专门为了应对 VMware 涨价大逃亡开发的"黑科技"。它不需要你登录ESXi 去导文件，PVE 自己会通过 API 去 ESXi 里面"偷"数据
 1、在 PVE 界面配置集成： 登录 PVE-Node-02 (P360) 的 Web 后台。点击 Datacenter -> Storage -> Add -> 选择 ESXi
 2、连接旧世界: 输入你ESXi的IP(192.168.1.22)、用户名(root)和密码
@@ -406,9 +406,8 @@ crw-rw-rw- 1 root root 119, 8  5月 23 05:20 /dev/vmnet8
 
 
 
-## 流派A
+## 流派A: 用官方原生工具
 ![image](./images/21.png)
-### 
 ```shell
 # esxi8上的vm (ubuntu24.10)的源
 rambo@test1:~$ sudo nano /etc/apt/sources.list
@@ -495,14 +494,15 @@ KVM
 ![image](./images/36.png)
 ![image](./images/37.png)
 ![image](./images/38.png)
+![image](./images/39.png)
 
 
 
 
-## 流派B
+## 流派B: 用命令行转换
 ```shell
 
-
+我没有ESXi 5.5/6.0的环境所以暂且没法做这个实验
 
 
 ```
@@ -511,7 +511,7 @@ KVM
 
 
 
-
+# 迁移windows
 
 
 
