@@ -273,6 +273,9 @@ rm -rf /mnt/pve/nfs-shared-storage
 重启 PVE 的核心管理服务（关键）
 这是最重要的一步，让 PVE 刷新它的存储状态机：
 systemctl restart pvedaemon pveproxy pvestatd
+
+如果是第二次或多次导致的nfs挂载不上，nfs在名字和路径等都相同的情况下则需要重启下esxi(玄学问题)
+
 ```
 ![image](./images/14.png)
 
@@ -407,12 +410,91 @@ crw-rw-rw- 1 root root 119, 8  5月 23 05:20 /dev/vmnet8
 ![image](./images/21.png)
 ### 
 ```shell
+# esxi8上的vm (ubuntu24.10)的源
+rambo@test1:~$ sudo nano /etc/apt/sources.list
+deb http://old-releases.ubuntu.com/ubuntu/ oracular main restricted universe multiverse
+deb http://old-releases.ubuntu.com/ubuntu/ oracular-updates main restricted universe multiverse
+deb http://old-releases.ubuntu.com/ubuntu/ oracular-security main restricted universe multiverse
+deb http://old-releases.ubuntu.com/ubuntu/ oracular-backports main restricted universe multiverse
 
 
+sudo apt update && sudo apt install vim wget curl net-tools openssh-client openssh-server -y
+rambo@test1:~$ sudo systemctl enable --now ssh
 
+# 是efi模式
+rambo@test1:~$ ls /boot/efi/
+EFI
+rambo@test1:~$ ls /boot/efi/EFI/
+BOOT  ubuntu
+
+
+# 模拟数据
+rambo@test1:~$ vim test.txt
+i don't know
+i'm sorry
+yes, it's
+good morning
+
+
+# 迁移
+esxi8上要迁移的vm必须先关机
+```
+![image](./images/23.png)
+![image](./images/24.png)
+![image](./images/25.png)
+![image](./images/26.png)
+```shell
+点击import后的底层逻辑: PVE会在后台自动调用ovftool或者内置转换流，把VMware的vmdk磁盘切片，一边拉取一边直接转换成PVE识别的格式，并自动注入VirtIO驱动
 
 ```
 
+![image](./images/27.png)
+```shell
+# ===================== vm不关机可能会报如下错 =============================
+  Rounding up size to full physical extent 4.00 MiB
+  Logical volume "vm-100-disk-0" created.
+transferred 0.0 B of 128.0 KiB (0.00%)
+transferred 128.0 KiB of 128.0 KiB (100.00%)
+transferred 128.0 KiB of 128.0 KiB (100.00%)
+efidisk0: successfully created disk 'local-lvm:vm-100-disk-0,size=4M'
+create full clone of drive (oldesxi8:ha-datacenter/ESXi-NFS-Share/ub24-1/ub24-1.vmdk)
+  Logical volume "vm-100-disk-1" created.
+transferred 0.0 B of 40.0 GiB (0.00%)
+qemu-img: error while reading at byte 0: Input/output error
+  Logical volume "vm-100-disk-0" successfully removed.
+  Logical volume "vm-100-disk-1" successfully removed.
+TASK ERROR: unable to create VM 100 - cannot import from 'oldesxi8:ha-datacenter/ESXi-NFS-Share/ub24-1/ub24-1.vmdk' - copy failed: command '/usr/bin/qemu-img convert -p -n -f vmdk -O raw /run/pve/import/esxi/oldesxi8/mnt/ha-datacenter/ESXi-NFS-Share/ub24-1/ub24-1.vmdk zeroinit:/dev/pve/vm-100-disk-1' failed: exit code 1
+# ===========================================================================
+```
+![image](./images/28.png)
+![image](./images/29.png)
+![image](./images/30.png)
+![image](./images/31.png)
+![image](./images/32.png)
+![image](./images/33.png)
+```shell
+# 原因分析
+在ESXi里这台虚拟机网卡用的是vmxnet3，还记得吧
+但在PVE/KVM里默认变成VirtIO、Intel E1000
+所以Linux内核会发现原来的网卡没了，于是原来ens160现在可能变成ens18或者eth0等等
+所以系统启动后网络配置还在找ens160,但系统实际只有ens18所以网络直接失效
+这是 VMware 迁移里最经典的问题
+
+以下项目企业里迁移时全都会遇到这种情况
+VMware
+OpenStack
+KVM
+公有云
+
+
+# 修复
+注: 下面的问题应该是我有挂clash verge导致的，把clash关闭后重启了vmware后就都好了
+```
+![image](./images/34.png)
+![image](./images/35.png)
+![image](./images/36.png)
+![image](./images/37.png)
+![image](./images/38.png)
 
 
 
