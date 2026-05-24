@@ -125,6 +125,15 @@ deb-src https://mirrors.ustc.edu.cn/debian/ bookworm-backports main non-free non
 
 rambo@debian2:~$ sudo apt update && sudo apt install nfs-kernel-server -y
 
+
+
+
+如果新添加了磁盘又不想reboot让机器能识别到, 则需要在线扫描新磁盘(核心), 这是企业里最常用的方法
+echo "- - -" | sudo tee /sys/class/scsi_host/host*/scan
+fdisk -l 应该就能识别到，如还没出则：
+sudo partprobe 或 sudo udevadm trigger
+
+
 rambo@debian2:~$ sudo lsblk
 NAME   MAJ:MIN RM  SIZE RO TYPE MOUNTPOINTS
 sda      8:0    0  200G  0 disk 
@@ -297,7 +306,7 @@ systemctl restart pvedaemon pveproxy pvestatd
 
 
 
-# 在esxi中装个linux系统(为迁移做准备)
+# 在esxi中装2个linux系统(BIOS格式和EFI格式, 为迁移做准备)
 ```shell
 在ESXi里面塞一个测试用的Linux小虚拟机，准备演练大厂最怕、开源最爱的 ESXi → PVE抽干迁移了
 
@@ -373,7 +382,7 @@ crw-rw-rw- 1 root root 119, 8  5月 23 05:20 /dev/vmnet8
 ## 迁移前奏
 ```shell
 不同的客户情况不同，必须掌握以下两种手段：
-流派A: 用PVE8.x官方原生API抽干(首选)
+方法1: 用PVE8.x官方原生API抽干(首选)
 这是 Proxmox 官方近年专门为了应对 VMware 涨价大逃亡开发的"黑科技"。它不需要你登录ESXi 去导文件，PVE 自己会通过 API 去 ESXi 里面"偷"数据
 1、在 PVE 界面配置集成： 登录 PVE-Node-02 (P360) 的 Web 后台。点击 Datacenter -> Storage -> Add -> 选择 ESXi
 2、连接旧世界: 输入你ESXi的IP(192.168.1.22)、用户名(root)和密码
@@ -382,17 +391,48 @@ crw-rw-rw- 1 root root 119, 8  5月 23 05:20 /dev/vmnet8
 5、底层逻辑: PVE会在后台自动调用 ovftool 或者内置转换流，把 VMware 的 vmdk 磁盘切片，一边拉取一边直接转换成 PVE 识别的格式，并自动注入 VirtIO 驱动
 
 
-流派B：硬核命令行转换 --- 离线冷迁移(突发状况救命用)
+方法2: 硬核命令行转换 --- 离线冷迁移(突发状况救命用)
 如果客户的ESXi版本太旧(比如ESXi 5.5/6.0)，或者网络有防火墙，PVE官方工具连不上，就必须用底层命令行解决：
 1、在ESXi里把这台 Linux 虚拟机关机
 2、通过 ESXi 的 Datastore 浏览器，把该虚拟机的 .vmdk 文件直接下载到你的宿主机(我的是Linux Mint)，或者通过scp直接传到 PVE-Node-02 的 /root/ 目录下
 3、在PVE命令行执行硬核转换：
-     qemu-img convert -f vmdk -O qcow2 linux-vm.vmdk  linux-vm.qcow2
+     qemu-img convert -f vmdk -O qcow2 linux-vm.vmdk  linux-vm.qcow2      # 转换后的就是pve要用的镜像
 4. 在PVE里新建一个空虚拟机，然后用命令行把这个 `qcow2` 磁盘强行塞进去：
    qm importdisk <新VM_ID>  linux-vm.qcow2  nfs-shared-storage
 
 
-不管用流派A还是流派B，当你把虚拟机迁移到PVE之后，点击Start(开机)
+方法3: 真正的"原地转生" —— 共享存储零拷贝(推荐，耗时0秒)
+如果客户的 VMware 原本就挂载了NAS、SAN或者是像 NFS 这种共享存储，则根本不需要拷贝这1TB的文件
+核心步骤：
+让pve节点直接通过网络挂载客户现有的VMware存储卷(比如直接挂载同一个nfs目录)
+在pve终端，直接用qemu-img读取原 .vmdk，并把转换后的数据直接写入pve自己的本地高速度存储(如 local-lvm 或 Ceph)
+或者更绝：kvm本身就原生支持直接读取 .vmdk 格式。可直接在pve里建一个虚拟机，配置文件直接指向那个1TB的.vmdk文件。开机直接用
+等后续有空了再在后台在线将磁盘格式转换(Storage Migration)为 qcow2 或 raw。整个迁移过程，应用停机时间不超过5分钟
+因为本次我的esxi和pve挂载了同一个Debian NFS存储：
+登录pve的终端，进入 /mnt/pve/nfs-shared-storage/ub24-1/ 就能看到40G大小的ub24-1.vmdk
+直接在pve终端执行本地转换，把它转到pve本地的local-lvm存储里，或直接在nfs目录下就地转换
+
+
+
+方法4: 管道级 --- 边传、边转、边写
+如果VMware 和 PVE 处于不同的物理机房，磁盘必须跨网络传输则绝对不能先用scp下到本地再转
+要用Linux管道(pipe)结合ssh和qemu-img，让数据变成流。在pve终端执行一行命令：
+ssh root@esxi-ip "cat /vmfs/volumes/datastore1/vm/disk.vmdk" | qemu-img convert -f vmdk -O qcow2 /dev/stdin /var/lib/vz/images/101/vm-101-disk-0.qcow2
+底层原理：
+ssh ... cat：从远程esxi物理机上把1TB的文件读出来后直接吐到网络管道里
+|（管道）：在内存中接住网络传过来的数据
+/dev/stdin：qemu-img不去读硬盘文件，而是直接守在内存门口(标准输入)，来1MB数据就地转换1MB然后直接写入pve的最终目标硬盘里 
+效果： 整个过程不需要任何中转空间，两台机器的硬盘都在全速读写，速度完全取决于你的网络带宽(万兆网络下1TB也就十几分钟) 
+
+
+方法5: 生产环境终极降噪 --- 用 virt-v2v自动接管
+virt-v2v是红帽官方主导的虚拟化迁移工具
+在pve上安装好 virt-v2v 后，只需要给它esxi的密码，pve的路径即可，它会自己登录esxi，通过网络流把数据拉过来，在内存里完成 vmdk 到 qcow2 的转换
+最重要的是：它会自动分析这个1TB磁盘里的系统，自动卸载里面的VMware Tools，自动安装KVM的 VirtIO驱动，最后在pve把虚拟机创建好
+
+
+
+不管用哪个方法，当你把虚拟机迁移到PVE之后，点击Start(开机)
 满分结果: 虚拟机顺利看到Grub引导菜单，顺利进入 Linux 登录界面，输入密码进去，/root/test.txt 文件完好无损
 
 翻车结果(企业迁移最常见故障): 屏幕卡在 Gave up waiting for root file system device 或者蓝屏/黑屏，提示找不到硬盘
@@ -406,7 +446,8 @@ crw-rw-rw- 1 root root 119, 8  5月 23 05:20 /dev/vmnet8
 
 
 
-## 流派A: 用官方原生工具
+## 方法1: 用官方原生工具
+### EFI格式
 ![image](./images/21.png)
 ```shell
 # esxi8上的vm (ubuntu24.10)的源
@@ -498,12 +539,327 @@ KVM
 
 
 
+### BIOS格式
+<font color=red>**在ESXI8上安装系统**</font>
+![image](./images/40.png)
+![image](./images/41.png)
 
-## 流派B: 用命令行转换
 ```shell
+# 需要自己配置IP
+[rambo@192 ~]$ sudo nmcli con mod ens192 \
+ipv4.addresses 192.168.2.146/24 \
+ipv4.gateway 192.168.2.1 \
+ipv4.dns 192.168.2.1 \
+ipv4.method manual
 
-我没有ESXi 5.5/6.0的环境所以暂且没法做这个实验
+[rambo@192 ~]$ sudo nmcli con up ens192
 
+[rambo@192 ~]$ ip a 
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000
+    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+    inet 127.0.0.1/8 scope host lo
+       valid_lft forever preferred_lft forever
+    inet6 ::1/128 scope host 
+       valid_lft forever preferred_lft forever
+2: ens192: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP group default qlen 1000
+    link/ether 00:0c:29:3e:99:5d brd ff:ff:ff:ff:ff:ff
+    inet 192.168.2.146/24 brd 192.168.2.255 scope global noprefixroute ens192
+       valid_lft forever preferred_lft forever
+    inet6 fe80::20c:29ff:fe3e:995d/64 scope link noprefixroute 
+       valid_lft forever preferred_lft forever
+3: virbr0: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500 qdisc noqueue state DOWN group default qlen 1000
+    link/ether 52:54:00:47:cc:86 brd ff:ff:ff:ff:ff:ff
+    inet 192.168.122.1/24 brd 192.168.122.255 scope global virbr0
+       valid_lft forever preferred_lft forever
+4: virbr0-nic: <BROADCAST,MULTICAST> mtu 1500 qdisc fq_codel master virbr0 state DOWN group default qlen 1000
+    link/ether 52:54:00:47:cc:86 brd ff:ff:ff:ff:ff:ff
+
+
+[rambo@192 ~]$ ping -c3 qq.com
+PING qq.com (123.150.76.218) 56(84) bytes of data.
+64 bytes from 123.150.76.218 (123.150.76.218): icmp_seq=1 ttl=52 time=18.10 ms
+64 bytes from 123.150.76.218 (123.150.76.218): icmp_seq=2 ttl=52 time=19.0 ms
+64 bytes from 123.150.76.218 (123.150.76.218): icmp_seq=3 ttl=52 time=19.4 ms
+
+--- qq.com ping statistics ---
+3 packets transmitted, 3 received, 0% packet loss, time 2004ms
+rtt min/avg/max/mdev = 18.977/19.124/19.394/0.221 ms
+
+```
+
+
+#### 迁移方法
+![image](./images/42.png)
+```shell
+在esxi8上下载rocky8的.vmdk文件时会出现下载2个文件，一个是rocky8.5.vmdk(525B大小)，一个是rocky8.5-flat.vmdk(40G大小)
+
+VMware磁盘体系:
+descriptor.vmdk 是元数据
+flat.vmdk 是真实数据
+delta.vmdk 是snapshot 差异
+sesparse.vmdk 是快照扩展
+
+虚拟化存储本质是 metadata + data separation
+
+迁移时最容易踩坑(非常重要)
+很多人只拷贝了flat.vmdk
+然后VMware/PVE不认, 因为缺descriptor
+
+正确做法企业标准)是两个都要
+如果在做 VMware -> PVE，通常只导入 descriptor.vmdk 即可
+例如PVE：
+qm importdisk 100 rocky8.5.vmdk local-lvm             # descriptor会自动找到flat文件
+
+
+rocky8.5.vmdk(525B)这是descriptor file(描述文件)里面保存以下信息,几乎不存数据,所以只有几百字节很正常
+磁盘类型
+geometry
+adapter type
+指向 flat 文件
+
+descriptor 文件里有什么？
+cat rocky8.5.vmdk                  # 可能会看到以下内容
+RW 83886080 VMFS "rocky8.5-flat.vmdk"
+注: 意思是rocky8.5-flat.vmdk这个虚拟盘真正的数据
+
+
+rocky8.5-flat.vmdk(40G)这才是真正的虚拟磁盘数据都在这里
+系统：
+    OS
+    文件
+    分区
+    数据
+
+
+可理解成：
+rocky8.5.vmdk
+    ↓
+“索引文件”
+
+rocky8.5-flat.vmdk
+    ↓
+真正磁盘
+
+
+如果只剩 flat.vmdk 怎么办？(很值钱)真实企业经常碰到的事故
+可以手工重建descriptor,例如执行下面的命令然后替换flat:
+vmkfstools -c 40G -d thin temp.vmdk
+
+企业里最常见的是 "存储炸了" 最后只剩 -flat.vmdk 此时会修 descriptor 的人很少
+
+
+
+```
+
+
+
+> 官方API导入虽然方便但会有很多坑,比如：
+网卡残留
+VMware MAC
+cloud-init
+VirtIO
+DHCP
+BIOS/EFI
+>
+而手工迁移才是真正企业里需要的能力
+
+
+
+
+
+## 方法2: 用命令行转换
+```shell
+如果客户的esxi版本太旧(比如esxi5.5/6.0)，或网络有防火墙，PVE官方工具连不上，就必须用命令行解决,这个实验我还用esxi8来做：
+1、在esxi里把这台Linux虚拟机关机
+2、通过ESXi的Datastore浏览器，把该虚拟机的.vmdk文件直接下载到宿主机，或通过scp直接传到PVE-Node-02的/root/目录下
+3、在PVE命令行执行硬核转换：
+	qemu-img convert -f vmdk -O qcow2 linux-vm.vmdk linux-vm.qcow2       # 转换后的就是pve要用的镜像
+注：
+企业里通常更常用(推荐)
+qm importdisk 100 xxx.vmdk local-lvm --format raw      或 --format qcow2
+raw的优点是性能最好,尤其：
+Ceph
+LVM-thin
+ZFS zvol
+
+而qcow2的缺点是性能损耗，优点:
+snapshot
+thin
+compression
+
+
+4. 在pve里新建一个空虚拟机，然后用命令行把这个qcow2 磁盘强行塞进去：
+   	qm importdisk <新VM_ID> linux-vm.qcow2 nfs-shared-storage
+
+qm importdisk 100 rocky8.5.vmdk local-lvm
+qm是Proxmox  管理命令，是PVE最核心的迁移命令之一，类是kvm的virsh,企业里大量都会用：
+VMware → PVE
+qcow2 → raw
+vmdk → lvm-thin
+
+导入后pvw会：
+    1) 读取vmdk
+    2) 转换格式，通常是raw格式
+    3) 写入 local-lvm
+    4) 生成：vm-100-disk-0
+
+导入后并不会自动挂载还需进入vm -> Hardware 把 Unused Disk 挂到SCSI、virtio、stat
+
+#==================================================================
+逐段拆解
+这条命令本质上是在做VMware 磁盘 → Proxmox 存储池的格式转换与导入
+importdisk意思是导入虚拟磁盘
+本质是转换格式 + 写入 PVE storage
+底层通常调用qemu-img
+
+100是vm id
+注意(关键), 这里vm必须已经存在
+例如你已经创建了一个空vm,其id=100，但不需要硬盘
+
+rocky8.5.vmdk是VMware descriptor文件
+PVE会自动找到rocky8.5-flat.vmdk并读取真实数据
+如果写成rocky8.5-flat.vmdk通常会失败，因为flat本身缺metadata
+
+local-lvm是pve存储池名字
+查看PVE存储池:
+数据中心(Datacenter) -> 存储(Storage)
+会看到：
+local
+local-lvm      # 适合生产、高性能、正是运行的vm
+nfs-storage    # nfs适合备份、中专、iso、临时迁移等
+ceph
+# ==================================================================
+
+企业里通常更常用(推荐)
+qm importdisk 100 xxx.vmdk local-lvm --format raw      或 --format qcow2
+raw的优点是性能最好
+尤其：
+Ceph
+LVM-thin
+ZFS zvol
+
+而qcow2的缺点是性能损耗，优点:
+snapshot
+thin
+compression
+
+
+
+# 流程总结: 适合小项目
+第一步 在esxi中关闭vm
+第二步 下载.vmdk、-flat.vmdk
+第三步 pve创建空vm(直接删除默认磁盘,cpu/mem正常设置),例如id 101
+    注意：
+	BIOS/UEFI 要一致
+	Machine type 尽量一致
+	SCSI Controller推荐VirtIO SCSI
+
+
+
+企业真实迁移第一原则先启动, 不是先高性能
+
+
+```
+### bios格式
+![image](./images/43.png)
+![image](./images/44.png)
+![image](./images/45.png)
+![image](./images/46.png)
+![image](./images/47.png)
+![image](./images/48.png)
+![image](./images/49.png)
+![image](./images/50.png)
+
+```shell
+第四步 进到.vmdk和-flat.vmdk所在位置并开始转换
+第五步(核心)
+root@pve:~# cd /mnt/pve/nfs-shared-storage1/rocky8.5/
+root@pve:/mnt/pve/nfs-shared-storage1/rocky8.5# ls -alh *.vmdk
+-rw------- 1 root root 40G May 24 15:52 rocky8.5-flat.vmdk
+-rw------- 1 root root 528 May 24 15:38 rocky8.5.vmdk
+
+# 用pve官方推荐方式，导入到nfs的挂载上，如果nfs/local-lvm空间不够执行以下命令时会提示，务必注意
+root@pve:/mnt/pve/nfs-shared-storage1/rocky8.5# qm importdisk 101 rocky8.5.vmdk  nfs-shared-storage1
+importing disk 'rocky8.5.vmdk' to VM 101 ...
+Formatting '/mnt/pve/nfs-shared-storage1/images/101/vm-101-disk-0.raw', fmt=raw size=42949672960 preallocation=off
+transferred 0.0 B of 40.0 GiB (0.00%)
+transferred 413.7 MiB of 40.0 GiB (1.01%)
+transferred 823.3 MiB of 40.0 GiB (2.01%)
+transferred 1.2 GiB of 40.0 GiB (3.04%)
+....
+    ....
+transferred 39.5 GiB of 40.0 GiB (98.82%)
+transferred 39.9 GiB of 40.0 GiB (99.84%)
+transferred 40.0 GiB of 40.0 GiB (100.00%)
+transferred 40.0 GiB of 40.0 GiB (100.00%)
+unused0: successfully imported disk 'nfs-shared-storage1:101/vm-101-disk-0.raw'
+
+
+
+第六步 在pve GUI中点击vm -> Hardware双击Unused Disk修改下面的项(一般默认不用改)
+    Bus/Device：SCSI
+    Controller：VirtIO SCSI
+    点击右下角的 "添加"即可
+第七步 添加virtio 网卡
+第八步 进入系统删除 VMware tools,并安装 qemu-guest-agent
+第九步 修复netplan、grub、initramfs
+
+
+
+# 下图中要把高级勾选后"OK"才会变成"添加"
+```
+![image](./images/51.png)
+![image](./images/52.png)
+```shell
+如果下图改stat后也必须同步改boot order,否则BIOS可能找不到启动盘
+```
+![image](./images/53.png)
+![image](./images/54.png)
+![image](./images/55.png)
+![image](./images/56.png)
+![image](./images/57.png)
+```shell
+# 下图还需设置开机自启动
+nmcli con mod ens18 connection.autoconnect yes
+```
+![image](./images/58.png)
+![image](./images/59.png)
+
+```shell
+# 稳定后再优化
+把网络模型改成 VirtIO
+
+把Disk 改成 VirtIO SCSI会起不来(符合企业迁移的真实情况,先在SATA模式正常启动)，如果你要改，务必记得改后还要改引导
+VirtIO更强是因为它不是模拟真实硬件, 而是半虚拟化驱动,性能极高
+
+每改一次启动看一下，如下图先改网络的模型
+
+```
+
+![image](./images/60.png)
+![image](./images/61.png)
+```shell
+下图改完后务必记得还要  改引导 !!!
+```
+![image](./images/62.png)
+![image](./images/63.png)
+
+
+
+
+### efi格式(略)
+```shell
+efi格式就不测试了,一般也用不到这种转换的方式
+EFI迁移的本质也是这样,但EFI比BIOS更复杂, 因为EFI除了rootfs还有EFI System Partition(ESP), 例如：/boot/efi
+所以EFI VM迁移时必须：
+1）PVE也使用OVMF, 即BIOS = OVMF
+2）Machine type 尽量一致, 推荐q35
+3）必须添加 EFI Disk
+
+PVE: Add -> EFI Disk否则经常找不到 EFI bootloader
+企业里不要混,应该:
+BIOS VM 最好迁 BIOS
+EFI VM 最好迁 EFI
 
 ```
 
@@ -511,9 +867,26 @@ KVM
 
 
 
-# 迁移windows
+
+# 方法3和方法2大致相同(略)
 
 
 
 
 
+
+# 方法4 管道级实时
+
+
+
+
+
+
+
+# 方法5 用virt-v2v自动接管
+```shell
+
+
+
+
+```
