@@ -95,6 +95,31 @@ HA触发： PVE-Node-01(拯救者)发现Node-02失联，立刻在本地接管业
 在Debian12上配置NFS时，/etc/exports 配置文件里一定要加上 no_root_squash 参数。因为 PVE 挂载存储时使用的是 root 权限，如果不加这个参数，PVE 将没有权限在 NFS 上创建虚拟机磁盘
 
 
+
+
+# esxi8开启ssh服务,在esxi黄黑控制台：
+→ 输入 root 密码
+→ Troubleshooting Options                  # 确认以下2项都开启
+Enable ESXi Shell = Enabled
+Enable SSH = Enabled
+
+然后按ALT + F1 (alt+f2是退回到黄黑的esxi管理页面)，进去执行/etc/init.d/SSH restart            # 不是小ssh
+
+如果已经进入ESXi Shell，常用运维命令：
+启动 SSH：vim-cmd hostsvc/start_ssh
+设置开机自启：vim-cmd hostsvc/enable_ssh
+关闭 SSH：vim-cmd hostsvc/stop_ssh
+取消自启：vim-cmd hostsvc/disable_ssh
+查看虚拟机：vim-cmd vmsvc/getallvms
+查看datastore：esxcli storage filesystem list
+重启管理服务：services.sh restart
+查看网卡：esxcli network nic list
+查看 VM 进程：esxcli vm process list
+查看防火墙: esxcli network firewall ruleset list | grep ssh
+开启ssh服务：esxcli network firewall ruleset set -e true -r sshServer
+
+
+
 ```
 
 
@@ -210,6 +235,8 @@ Export list for 192.168.2.113:
 
 # 2个pve设置
 ```shell
+# 默认web登录用户是root，这里2个密码都是8a
+
 # 修改IP
 root@pve:~# nano /etc/network/interfaces
 auto lo
@@ -247,6 +274,15 @@ configure this server - connect to:
 root@pve:~# reboot
 
 
+
+
+# 同步时间
+root@pve:~# timedatectl set-timezone Asia/Shanghai
+root@pve:~# timedatectl set-ntp true
+root@pve:~# systemctl restart systemd-timesyncd              # 如报错则说明你用的是chrony，执行下一行命令
+root@pve:~# systemctl restart chrony
+
+
 # 安装工具包
 1、替换企业源为免订阅源
 root@pve:~# mv /etc/apt/sources.list.d/{ceph.list,pve-enterprise.list} .
@@ -261,6 +297,14 @@ echo "deb https://mirrors.tuna.tsinghua.edu.cn/debian-security bookworm-security
 root@pve:~# echo "deb https://mirrors.tuna.tsinghua.edu.cn/proxmox/debian/pve bookworm pve-no-subscription" > /etc/apt/sources.list.d/pve-no-subscription.list
 
 root@pve:~# apt update && apt install vim wget curl net-tools -y
+
+
+
+# 非正常修改登录密码
+开机，按Ctrl+X 进入到grub模式(蓝色画面)不要按任何键，直接按e键
+用上下键把光标移到 linux /boot/vmlinuz-.... quiet 空格 init=/bin/bash 输好后，按Ctrl+X保存退出
+然后回重启，输入mount -rw -o remount /  回车
+输入passwd回车修改root密码，如果要换其它用户密码则是passwd zhangsan 回车
 
 ```
 
@@ -875,8 +919,58 @@ EFI VM 最好迁 EFI
 
 
 
-# 方法4 管道级实时
+# 方法4 管道级实时---半废
+```shell
+第三步：在pve上建好空壳，拿到最终写入路径
+1. 登录 PVE-Node-02 (P360) 的Web后台
+2.点击 Create VM（创建虚拟机）：
+	General：设置虚拟机ID(例如102)
+	OS：选择 "Do not use any media"(不使用任何介质)
+	System：保持默认
+	Disks：直接把自带的硬盘删掉(点那个垃圾桶图标)。我们需要一个完全没有硬盘的空壳
+	一路下一步直到完成
+3. 此时，PVE 会在它的本地逻辑卷(local-lvm)中自动为你预留位置，但还没分配实际块
 
+
+第四步：执行管道级流式传输(核心动作)
+# 在宿机上通过配置文件找到vm的物理路径
+rambo@e8bit:~$ ssh root@192.168.2.122 "vim-cmd vmsvc/getallvms"
+(root@192.168.2.122) Password: 
+Vmid     Name                      File                        Guest OS       Version   Annotation
+5      rocky8.5   [ESXI-NFS-Share1] rocky8.5/rocky8.5.vmx   centos7_64Guest   vmx-21 
+
+rambo@e8bit:~$ ssh root@192.168.2.122 "ls -alh /vmfs/volumes/"
+(root@192.168.2.122) Password: 
+total 1548
+drwxr-xr-x    1 root     root         512 May 24 17:10 .
+drwxr-xr-x    1 root     root         512 May 24 07:36 ..
+drwxr-xr-x    1 root     root           8 Jan  1  1970 26ebbad0-04481ffe-1094-c6d5b5452ea0
+drwxr-xr-t    1 root     root       76.0K May 23 07:25 6a11563f-e8acc822-7f9f-000c29d7ea74
+lrwxr-xr-x    1 root     root          35 May 24 17:10 BOOTBANK1 -> 26ebbad0-04481ffe-1094-c6d5b5452ea0
+lrwxr-xr-x    1 root     root          35 May 24 17:10 BOOTBANK2 -> bc6b9068-4e474bd7-f9bf-ca916110a32c
+lrwxr-xr-x    1 root     root          17 May 24 17:10 ESXI-NFS-Share1 -> eca5bd35-3a696585          # 查出来的vmdk文件在这里
+lrwxr-xr-x    1 root     root          17 May 24 17:10 ESXi-NFS-Share -> c2d6a58c-fb7a181e
+lrwxr-xr-x    1 root     root          35 May 24 17:10 OSDATA-6a11563f-e8acc822-7f9f-000c29d7ea74 -> 6a11563f-e8acc822-7f9f-000c29d7ea74
+drwxr-xr-x    1 root     root           8 Jan  1  1970 bc6b9068-4e474bd7-f9bf-ca916110a32c
+drwxrwxrwx    5 65534    65534       4.0K May 24 02:19 c2d6a58c-fb7a181e
+drwxr-xr-x    6 root     root        4.0K May 24 13:03 eca5bd35-3a696585                             # 这个是实际的目录
+
+
+# 先确认pve上的存储空间
+root@pve:~# df -Th
+Filesystem                                 Type      Size  Used Avail Use% Mounted on
+udev                                       devtmpfs   16G     0   16G   0% /dev
+tmpfs                                      tmpfs     3.2G  1.8M  3.2G   1% /run
+/dev/mapper/pve-root                       ext4       35G  3.1G   30G  10% /
+tmpfs                                      tmpfs      16G   46M   16G   1% /dev/shm
+tmpfs                                      tmpfs     5.0M     0  5.0M   0% /run/lock
+/dev/fuse                                  fuse      128M   20K  128M   1% /etc/pve
+tmpfs                                      tmpfs     3.2G     0  3.2G   0% /run/user/0
+192.168.2.113:/mnt/nfs_shares/pve_storage  nfs4       20G   10G  8.6G  54% /mnt/pve/nfs-shared-storage
+192.168.2.113:/mnt/nfs_shares/pve_storage1 nfs4       59G   12G   45G  21% /mnt/pve/nfs-shared-storage1     # 还够存放40G的镜像
+
+
+```
 
 
 
@@ -885,8 +979,122 @@ EFI VM 最好迁 EFI
 
 # 方法5 用virt-v2v自动接管
 ```shell
+在2026年的生产环境下, 面对 1TB~10TB 的超大虚拟机, 真正的大厂级开源标准方案就是 virt-v2v (Virtualization Vector). 它是红帽官方主导并深度维护的虚拟化迁移工具, 专门用来做企业级的大逃亡.
+
+virt-v2v的第一性原理: 它不仅做数据流式传输, 更核心的是它自带一个"OS医生" (virt-p2v/v2v-crypto), 能在数据传输的同时, 自动解剖目标盘的内核、卸载 VMware Tools、注入 KVM 的 VirtIO 驱动、重构 initramfs. 真正做到一键接管.
+
+以下是 2026 年最稳固、最适合你当前 PVE-Node-02 (192.168.2.x) 环境的 virt-v2v自动接管实战全流程
+
+第一步: 在pve上准备"武器库"
+virt-v2v需要一系列底层工具(如Guestfish虚拟文件系统工具)的支持来解剖Linux磁盘.
+在 PVE-Node-02 终端执行以下命令安装核心组件:
+root@pve:~# apt-get update && apt-get install -y virt-v2v libguestfs-tools sshfs nbdkit libnbd-bin
+virt-v2v在准备向你的NFS写入最终数据时，调用了Linux底层的 NBD(Network Block Device，网络块设备kit) 组件
+新版的virt-v2v极度依赖nbdkit来做高效率的流式数据落盘，而pve默认没有带这个包
+只安装nbdkit还不够,以为在 Debian/Ubuntu 软件源里, nbdcopy 和 nbdinfo 属于另一个叫做 libnbd-bin 的独立软件包
 
 
+# 下一条命令virt-v2v -v -x -i...可查看执行中的日志
+root@pve:~# virt-v2v -i vmx "/tmp/esxi_v2v/rocky8.5.vmx" -o local -os /mnt/pve/nfs-shared-storage1/images/102 -of qcow2 --bandwidth 50M
+[   0.0] Setting up the source: -i vmx /tmp/esxi_v2v/rocky8.5.vmx
+[   1.0] Opening the source
+[   5.2] Inspecting the source
+[  28.0] Checking for sufficient free disk space in the guest
+[  28.0] Converting Rocky Linux 8.5 (Green Obsidian) to run on KVM
+virt-v2v: This guest has virtio drivers installed.
+[ 102.9] Mapping filesystem data to avoid copying unused and blank areas
+[ 104.2] Closing the overlay
+[ 104.3] Assigning disks to buses
+[ 104.3] Checking if the guest needs BIOS or UEFI to boot
+[ 104.3] Setting up the destination: -o disk -os /mnt/pve/nfs-shared-storage1/images/102
+[ 105.4] Copying disk 1/1
+ 100% [****************************************]
+[1937.1] Creating output metadata
+virt-v2v: warning: unknown guest operating system: linux rocky 8.5 x86_64 
+(Rocky Linux 8.5 (Green Obsidian))
+[1937.2] Finishing off
 
+root@pve:~# ls -alh /mnt/pve/nfs-shared-storage1/images/102
+total 4.8G
+drwxr-xr-x 2 root root 4.0K May 25 11:50 .
+drwxr-xr-x 4 root root 4.0K May 25 10:53 ..
+-rw-r--r-- 1 root root 4.8G May 25 11:50 rocky8.5-sda           # 注入了kvm驱动的裸磁盘数据文件
+-rw-r--r-- 1 root root 1.5K May 25 11:50 rocky8.5.xml           # 虚拟机的标准硬件配置文件
+
+由于我们用了-o local(输出到本地目录)模式，pve的虚拟化管理器(pvedaemon)目前还没有把这个磁盘和具体的虚拟机id绑定起来
+接下来需要在pve界面里把这个 Rocky Linux 8.5 彻底拉起来并完成闭环
+
+
+第一步：在pve上创建一个空壳虚拟机(VM 102)
+我们需要给这个磁盘搭一个"家"
+1. 登录pve Web界面
+2. 点击右上角的 Create VM(创建虚拟机):
+	General：VM ID 填 102，名称写 rocky8.5
+	OS：选择 Do not use any media(不使用任何介质)
+	System：保持默认(如果在esxi里是用UEFI引导的，这里就选OVMF/UEFI；如果是传统引导，保持默认的SeaBIOS)
+	Disks：直接点击右下角的垃圾桶图标，把自带的那个磁盘删掉(因为我们要用刚才搬过来的盘，不需要新盘)
+	CPU / Memory：根据需求分配，尽量与旧环境一致
+	Network：选择你的网桥(通常是vmbr0)，网卡模型保持 VirtIO (semi-virtualized)
+3. 一路下一步直到完成
+
+第二步：将搬迁过来的磁盘强行"改名并归位"
+因为virt-v2v生成的文件名叫rocky8.5-sda，而pve的NFS存储对磁盘命名有严格的格式规范(格式必须是vm-102-disk-0.qcow2).所以直接做重命名和类型修正
+在pve终端执行以下两条命令：
+# 1. 顺手把后缀改成标准的.qcow2格式(virt-v2v 实际导出的就是qcow2，只是没加后缀)
+root@pve:~# mv /mnt/pve/nfs-shared-storage1/images/102/rocky8.5-sda    /mnt/pve/nfs-shared-storage1/images/102/vm-102-disk-0.qcow2
+
+# 2. 让pve强制重新扫描vm 102的目录，刷新注册表
+root@pve:~# qm rescan --vmid 102
+rescan volumes...
+VM 102 add unreferenced volume 'nfs-shared-storage1:102/vm-102-disk-0.qcow2' as 'unused0' to config
+
+
+第三步：挂载磁盘并激活开机
+1. 回到pve网页后台，点击刚建好的102(rocky8.5)虚拟机
+2. 点击Hardware(硬件) 菜单会看到一个黄色的图标写着Unused Disk 0
+3. 双击这个 Unused Disk 0:
+	Bus/Device(总线/设备): 选择SCSI
+	Cache(缓存): 生产环境建议选择Write back(unsafe)或默认，提升nfs性能
+	点击Add(添加)
+```
+![image](./images/64.png)
+
+```shell
+4. 点击Options(选项) ---> 双击Boot Order(引导顺序):
+	把刚刚添加的scsi0勾选上，并且用鼠标把它拖动到第一位(最顶上)
+	点击OK保存,然后开机
+```
+![image](./images/65.png)
+![image](./images/66.png)
+
+```shell
+# 登录进去后发现没有IP
+1. 修改网卡名
+[rambo@lcoalhost ~]$ cd /etc/sysconfig/network-scripts/
+[rambo@lcoalhost network-scripts]$ sudo mv ifcfg-ens192  ifcfg-ens18
+[rambo@lcoalhost network-scripts]$ nmcli con modify ens192  connection.id ens18
+[rambo@lcoalhost network-scripts]$ sudo nmcli con mod ens18 \
+ipv4.addresses 192.168.2.146/24 \
+ipv4.gateway 192.168.2.1 \
+ipv4.dns 192.168.2.1 \
+connection.autoconnect yes \
+ipv4.method manual
+
+[rambo@192 ~]$ sudo nmcli con reload
+[rambo@192 ~]$ sudo nmcli con up ens18
+[rambo@192 ~]$ sudo nmcli con show
+[rambo@192 ~]$ ping qq.com
 
 ```
+
+
+
+
+
+
+
+
+
+
+
+
