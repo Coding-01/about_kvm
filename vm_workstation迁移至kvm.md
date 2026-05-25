@@ -1923,9 +1923,6 @@ Q4: EFI迁移后，虽然配置了 --boot uefi，但仍进入了EFI Shell
 解决思路：在EFI Shell提示符下，手动通过 fs0: 进入EFI分区，找到 EFI/ubuntu/grubx64.efi 或 EFI/almalinux/shimx64.efi 手动引导系统；
 进入系统后，必须立刻执行 grub-install 或 efibootmgr 重新将当前的引导路径强制写入 KVM 的 OVMF 虚拟 NVRAM 中
 
-
-
-
 ```
 
 
@@ -1935,49 +1932,4 @@ Q4: EFI迁移后，虽然配置了 --boot uefi，但仍进入了EFI Shell
 
 
 
-# 迁移windows
-## 迁移win7
-```shell
 
-
-
-```
-
-
-
-## 迁移win10
-```shell
-
-```
-
-
-## 迁移win11
-```shell
-
-
-```
-
-
-## 迁移winserver 2008
-```shell
-
-
-```
-
-
-## 迁移winserver 2012
-```shell
-
-```
-
-
-## 迁移winserver 2016
-```shell
-
-```
-
-
-## 迁移winserver 2019
-```shell
-
-```
