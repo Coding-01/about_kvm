@@ -96,7 +96,6 @@ HA触发： PVE-Node-01(拯救者)发现Node-02失联，立刻在本地接管业
 
 
 
-
 # esxi8开启ssh服务,在esxi黄黑控制台：
 → 输入 root 密码
 → Troubleshooting Options                  # 确认以下2项都开启
@@ -118,9 +117,129 @@ Enable SSH = Enabled
 查看防火墙: esxcli network firewall ruleset list | grep ssh
 开启ssh服务：esxcli network firewall ruleset set -e true -r sshServer
 
+```
+
+
+
+
+
+# 实际生产中的优化(导读)
+```shell
+这一部分和该文档中的所有可以看作是分开的, 因为这部分会从网络、性能、排错、安全四个维度进一步的深度优化建议, 因为这部分是在文档做完后加的：
+
+在2026年的中小企业和传统行业市场中，除了互联网大厂和金融巨头外，80%的企业VMware虚拟化集群，规模都在10~50台VM之间
+即使遇到拥有100台以上虚拟机的客户，他们在做VMware往pve搬迁时，也绝对不会安排在同一个晚上把100台机器全部切过去。大厂的真实操作叫做"分批割接(Phase-based Migration)"
+第一周：迁移 5 台无关紧要的测试环境(灰度验证)
+第二周：迁移 15 台边缘业务、内部OA(扩大战果)
+第三周：迁移 30 台核心 Web、中间件
+第四周：最后动核心数据库
+这就意味着在每个割接窗口(通常是周六凌晨0:00 - 4:00)，实际经手操作的虚拟机数量通常只有5~15台
+
+在绝大多数实际项目中，老运维都会明令禁止在搬迁时使用Cloud-init
+因为Cloud-init的原生设计场景是"从零初始化一个全新的干净系统(如刚购买的阿里云ess 裸机)"，而不是用来"接管一个已经跑了五六年的老系统"
+
+让 virt-v2v 只做它最擅长的事,把驱动(硬盘、网卡)转好，不要让它乱动网络配置文件
+
+
+一、 网络层：引入"管理、存储、业务"三网分离架构
+在企业内绝对不能把所有流量都堆在 192.168.2.x 这一个扁平网络里。大文件迁移的吞吐量(千兆/万兆)会瞬间把路由器的cpu冲爆，导致整个局域网内其他生产业务全部掉线
+在实施前必须在pve和物理交换机上划分VLAN来将流量隔离:
+管理网(Management): 用于pve集群通信(Corosync协议极其敏感，延迟超过50ms就会导致集群解体)、Web登录
+存储网(Storage/Migration): 用于NFS/ZFS挂载和virt-v2v传输。建议至少10Gbps(万兆)起步，并开启MTU 9000(巨型帧，Jumbo Frames)降低CPU软中断
+业务网(VM Network): 虚拟机实际对外提供服务的网络
+
+二、性能层：突破存储与内核的极限吞吐
+上述用的是 -o local -os /mnt/pve/... -of qcow2。在企业级全闪存(NVMe SSD)或分布式存储(Ceph/ZFS)环境下，这种打法存在严重的双重写入惩罚和序列化瓶颈
+生产级写入优化：
+1. 彻底放弃qcow2，全面拥抱raw格式或直接落盘到块设备(块级裸联):
+在ceph 或pve LVM-Thin存储上，raw格式是绝对的霸主(性能比qcow2高出15%~30%)，且pve底层快照由存储卷自身实现，不需要依赖qcow2的内部快照
+修改上述命令将 -of qcow2 改为 -of raw，或者直接输出到pve的lvm池
+
+2. 多线程并发控制 --parallel：
+新版 virt-v2v 配合 nbdcopy 支持多线程并发数据块传输。面对企业几十 T 的盘，不加并发就是纯熬工时
+在命令里补上：--parallel 4(根据网络带宽和cpu核心数动态调整，千兆网用1~2，万兆网可以用4~8)
+
+三、 排错层：建立"海难级"故障观测与全链路排查矩阵
+企业实施最怕"卡死"和"未知错误"。需为前线实施工程师提供一套标准、递进的排错排查链(Troubleshooting Matrix), 故障现象比如:
+1. virt-v2v启动卡在 Opening the source 超过5分钟
+导致原因: esxi端为了自保，其sshd触发了高并发连接速率限制(MaxStartups)
+排查: 登录esxi，修改/etc/ssh/sshd_config 中的 MaxStartups 100:30:200 和 ClientAliveInterval 60，然后 services.sh restart
+
+2. 传输过程中突发 nbdcopy: Input/output error
+导致原因: 物理链路存在坏块或闪断；目标nfs临时空间(/tmp)溢出
+排查: 
+1). 执行dmesg | grep -i fuse检查sshfs是否断开；
+2). 检查pve根分区空间，迁移前使用export TMPDIR=/mnt/pve/nfs-shared-storage1/tmp强行更改virt-v2v的缓存目录
+
+3. 迁移开机后卡在Blinking Cursor(光标闪烁)或找不到引导盘
+导致原因: esxi的虚拟机原本是uefi固件，但pve的空壳虚拟机误选了默认的SeaBIOS
+排查: 不用重新迁移！直接在pve网页端修改：虚拟机-->硬件-->添加EFI Disk，并将BIOS修改为 OVMF(UEFI)
+
+4. 执行 virt-v2v 突发 libguestfs: error: /usr/bin/supermin ... failed
+导致原因: pve宿主机的Linux内核更新后，libguestfs的底层底层沙箱(AppArmor/Access Control)权限没有同步刷新
+排查: 
+在PVE-Node-02的宿主机终端(root权限)一键重建底层沙箱环境: update-guestfs-appliance    # 强行重新编译并刷新微型内存沙箱的系统镜像
+如依然报错则直接在PVE-Node-02终端执行前临时关闭沙箱限制: export LIBGUESTFS_BACKEND=direct
+在企业生产环境或魔改系统里，系统的安全策略(AppArmor/SELinux)经常会误杀libguestfs创建的临时进程，导致抛出 supermin ... failed 的权限拒绝错误
+使用 export LIBGUESTFS_BACKEND=direct 相当于给 virt-v2v 临时发了一张安全通行证，绕过系统那些层层设防的安全软件审核，让 QEMU 拥有直达特权。这通常是解决 virt-v2v 底层环境报错的终极杀手锏
+原理:
+当你在pve上运行virt-v2v准备去读写Rocky Linux 8.5的虚拟磁盘时，pve宿主机出于绝对的安全隔离考虑，是不允许外部程序直接把这个未经信任的镜像挂载到pve本地宿主机内核上的(防止镜像里有恶意木马利用内核漏洞攻击pve宿主机)
+为了解决安全挂载的问题，libguestfs采用了以下硬核架构：
+它会在pve内存里临时启动一个极其微型的、被裁剪过的linux虚拟机沙箱(这个沙箱就叫做Appliance，里面包含一个定制内核和最精简的工具集)
+virt-v2v所有的解剖内核、修改配置文件、卸载vmware-tools的高危手术，全部在这个内存沙箱虚拟机里安全执行
+手术做完后，沙箱自动销毁
+
+# 先一键刷新沙箱，然后带着直连环境变量轰炸迁移
+update-guestfs-appliance && LIBGUESTFS_BACKEND=direct virt-v2v -i vmx "/tmp/esxi_v2v/rocky8.5.vmx" ...
+
+
+5. 转换进度条卡在Closing the overlay超过10分钟不落盘
+导致原因: 目标nfs存储没有开启异步写入(async)，或底层固态硬盘在进行高并发随机写入时，触发了fuse的内核锁竞争(Lock Contention)
+排查:
+强行降低并发块深度并绕过fuse锁：
+在命令最前面补上环境变量，强制采用串行流写入: VIRT_V2V_NO_TUNNELLING=1 virt-v2v ...
+
+6. 迁移拉起后内核报 Kernel Panic - not syncing: VFS: Unable to mount root fs
+导致原因: 目标操作系统的旧引导配置中，由于使用了特定硬件的UUID，在转为kvm架构后，系统的initramfs内核镜像没有完全将旧的引导驱动剥离
+排查:
+硬核原地重建内核引导镜像:
+1. 用带有 Rocky 8 ISO 镜像挂载到VM 102，开机进入Rescue Mode(救援模式)
+2. 强行进入chroot环境：chroot /mnt/sysimage
+3. 重新为当前内核生成标准kvm驱动初始盘：dracut --force --regenerate-all
+注: 或者把磁盘类型改成stat,先能进入系统后再执行上一行命令
+
+
+四、兜底与反向回滚方案(企业级方案的灵魂)
+没有考虑回滚(Rollback)的方案在企业里是不合格的
+必须加入 [非破坏性实施准则]:
+1. 绝对禁忌: 严禁在迁移前卸载esxi源端虚拟机上的VMware Tools！一旦迁移失败或遭遇未知兼容性故障，由于你破坏了原系统环境，将直接导致业务无法原地复活
+virt-v2v具备影子转换特性：
+它在挂载时只读取VMX/VMDK，所有的修改和VMware Tools的卸载全都是在落盘到pve的那一层目标快照/数据流里动态完成的。原esxi上的虚拟机和文件完好无损
+
+2. 割接验证(Readiness Check):
+数据传输完成后，在pve上拉起VM 102之前，必须切断VM 102的虚拟网卡断开网络(Disconnect Network)，防止两台完全一模一样的Rocky 8.5同时在局域网内跑，引发严重的IP冲突和MAC地址漂移。验证应用正常、数据无误后，关掉esxi怨种服务器，再合上pve VM 102的网络电闸
+(1). 割接前的"原位不动"准则
+严禁提前卸载工具：在virt-v2v成功将数据写入pve并测试通过前，绝对不允许去esxXi卸载原虚拟机的 VMware Tools 或关闭其服务
+数据流只读性：virt-v2v基于sshfs或 vpx:// 读取 VMX/VMDK 时，底层全部是只读(Read-Only)挂载。所有内核注入、驱动卸载动作都发生在线转换的数据流和pve端的临时快照中
+(2). 灰度割接与断网测试(防止脑裂)
+断网拉起:当virt-v2v完成传输并在pve创建好VM 102后，首先点击虚拟机--->硬件--->网卡，将"已连接(Disconnect"的勾去掉
+开机静默验证: 在断网状态下开启VM 102，通过pve的VNC Console登录系统，检查数据库、Web 服务、业务数据是否完好。此时原esxi上的虚拟机仍然开机在线跑着业务，整个过程对业务无任何影响
+(3). 5分钟极速回滚操作
+一旦在pve端的断网测试中发现核心业务应用无法启动，且在15分钟内无法定位解决，立刻触发回滚
+停止pve端业务: 直接在pve上将VM 102强制关机(Stop)
+清理脏数据： 执行 qm destroy 102 --destroy-unreferenced-disks 瞬间格式化pve端转换失败的虚拟盘，不占用nfs存储空间
+确认源端状态： 检查esxi上的虚拟机状态。因为源端一直处于只读状态且保持开机，局域网网络流量完全没有发生过中断
+宣告回滚成功： 割接失败，业务零受损，回滚总耗时不超过1分钟
+
+
+
 
 
 ```
+
+
+
+
 
 
 
@@ -305,6 +424,10 @@ root@pve:~# apt update && apt install vim wget curl net-tools -y
 用上下键把光标移到 linux /boot/vmlinuz-.... quiet 空格 init=/bin/bash 输好后，按Ctrl+X保存退出
 然后回重启，输入mount -rw -o remount /  回车
 输入passwd回车修改root密码，如果要换其它用户密码则是passwd zhangsan 回车
+
+
+
+正常虚拟机存放应该在 /vmfs/volumes/datastore-name/虚拟机名字/
 
 ```
 
@@ -978,6 +1101,7 @@ tmpfs                                      tmpfs     3.2G     0  3.2G   0% /run/
 
 
 # 方法5 用virt-v2v自动接管
+## 迁移BIOS格式
 ```shell
 在2026年的生产环境下, 面对 1TB~10TB 的超大虚拟机, 真正的大厂级开源标准方案就是 virt-v2v (Virtualization Vector). 它是红帽官方主导并深度维护的虚拟化迁移工具, 专门用来做企业级的大逃亡.
 
@@ -992,6 +1116,18 @@ root@pve:~# apt-get update && apt-get install -y virt-v2v libguestfs-tools sshfs
 virt-v2v在准备向你的NFS写入最终数据时，调用了Linux底层的 NBD(Network Block Device，网络块设备kit) 组件
 新版的virt-v2v极度依赖nbdkit来做高效率的流式数据落盘，而pve默认没有带这个包
 只安装nbdkit还不够,以为在 Debian/Ubuntu 软件源里, nbdcopy 和 nbdinfo 属于另一个叫做 libnbd-bin 的独立软件包
+
+
+# 把nfs目录挂载过来
+root@pve:~# mkdir -p /tmp/esxi_v2v
+root@pve:~# mkdir -p /mnt/pve/nfs-shared-storage1/images/102
+root@pve:~# sshfs -o allow_other,idmap=user root@192.168.2.122:/vmfs/volumes/eca5bd35-3a696585/rocky8.5    /tmp/esxi_v2v
+注:2.122是esxi地址
+
+root@pve:~# df -Th | egrep '(esxi|mnt)'
+192.168.2.113:/mnt/nfs_shares/pve_storage                   nfs4         20G   16G  2.8G  86% /mnt/pve/nfs-shared-storage
+192.168.2.113:/mnt/nfs_shares/pve_storage1                  nfs4         59G   21G   36G  37% /mnt/pve/nfs-shared-storage1
+root@192.168.2.122:/vmfs/volumes/eca5bd35-3a696585/rocky8.5 fuse.sshfs   59G   21G   36G  37% /tmp/esxi_v2v
 
 
 # 下一条命令virt-v2v -v -x -i...可查看执行中的日志
@@ -1023,6 +1159,9 @@ drwxr-xr-x 4 root root 4.0K May 25 10:53 ..
 
 由于我们用了-o local(输出到本地目录)模式，pve的虚拟化管理器(pvedaemon)目前还没有把这个磁盘和具体的虚拟机id绑定起来
 接下来需要在pve界面里把这个 Rocky Linux 8.5 彻底拉起来并完成闭环
+
+💡 避坑细节: virt-v2v生成的rocky8.5.xml是标准的Libvirt XML硬件定义文件。由于Proxmox(PVE)使用的不是原生libvirt结构，而是自己的 /etc/pve/qemu-server/102.conf 架构，因此这个.xml文件在pve创建完空壳vm并执行 qm rescan 后已经失去了利用价值
+完成磁盘挂载后，可以直接执行 rm -f /mnt/pve/nfs-shared-storage1/images/102/rocky8.5.xml 清理垃圾，防止污染存储卷
 
 
 第一步：在pve上创建一个空壳虚拟机(VM 102)
@@ -1072,6 +1211,11 @@ VM 102 add unreferenced volume 'nfs-shared-storage1:102/vm-102-disk-0.qcow2' as 
 1. 修改网卡名
 [rambo@lcoalhost ~]$ cd /etc/sysconfig/network-scripts/
 [rambo@lcoalhost network-scripts]$ sudo mv ifcfg-ens192  ifcfg-ens18
+# ================================================
+# 如上一条命令失败后则可用这条命令把原来名为ens192的配置强行绑定到现在的pve虚拟网卡ens18上
+# [rambo@lcoalhost network-scripts]$ sudo nmcli con mod ens192 connection.interface-name  ens18
+# ================================================
+
 [rambo@lcoalhost network-scripts]$ nmcli con modify ens192  connection.id ens18
 [rambo@lcoalhost network-scripts]$ sudo nmcli con mod ens18 \
 ipv4.addresses 192.168.2.146/24 \
@@ -1085,7 +1229,160 @@ ipv4.method manual
 [rambo@192 ~]$ sudo nmcli con show
 [rambo@192 ~]$ ping qq.com
 
+
+一切都没问题后不要让sshfs的虚拟挂载一直常驻在本地/tmp里，一旦esxi重启，pve本地的这个目录就会变成"僵尸目录"，导致 df -h 直接卡死
+# 迁移大功告成后，强行解绑 SSHFS 挂载点，保持 PVE 节点纯净
+[rambo@192 ~]$ fusermount -u /tmp/esxi_v2v && rmdir /tmp/esxi_v2v
+
+
 ```
+
+
+
+
+## 迁移EFI格式
+![image](./images/67.png)
+```shell
+# 在esxi8上
+[root@localhost:~] ls -alh /vmfs/volumes/eca5bd35-3a696585/
+total 36
+drwxr-xr-x    7 root     root        4.0K May 25  2026 .
+drwxr-xr-x    1 root     root         512 May 25 04:49 ..
+drwxr-xr-x    3 root     root        4.0K May 25  2026 images
+drwx------    2 root     root       16.0K May 24 02:26 lost+found
+drwxr-xr-x    2 root     root        4.0K May 24 07:52 rocky8.5
+drwxr-xr-x    4 root     root        4.0K May 24 13:03 template
+drwxr-xr-x    2 root     root        4.0K May 25  2026 ub24.4-1
+
+
+# 在pve2上
+root@pve:~# mkdir -p /tmp/esxi_v2v_ub24
+root@pve:~# mkdir -p /mnt/pve/nfs-shared-storage1/images/100
+root@pve:~# sshfs -o allow_other,idmap=user root@192.168.2.122:/vmfs/volumes/eca5bd35-3a696585/ub24.4-1    /tmp/esxi_v2v_ub24
+root@pve:~# df -Th | grep ub24
+root@192.168.2.122:/vmfs/volumes/eca5bd35-3a696585/ub24.4-1 fuse.sshfs   59G   21G   36G  37% /tmp/esxi_v2v_ub24
+root@pve:~# virt-v2v -i vmx "/tmp/esxi_v2v/ub24.4-1.vmx" -o local -os /mnt/pve/nfs-shared-storage1/images/100  -of raw --bandwidth 50M
+注: 这里我换成了raw格式, 务必注意
+[   0.0] Setting up the source: -i vmx /tmp/esxi_v2v_ub24/ub24.4-1.vmx
+qemu-nbd: Failed to blk_new_open '/tmp/esxi_v2v_ub24/ub24.4-1.vmdk': Could not open '/tmp/esxi_v2v_ub24/ub24.4-1-flat.vmdk': Operation not permitted
+virt-v2v: Exiting on signal SIGINT
+
+
+# 在pve节点上查看
+root@pve:~# ls -alh /tmp/esxi_v2v_ub24/ub24.4-1.vmx
+-rwxr-xr-x 1 root root 3.1K May 25 20:57 /tmp/esxi_v2v_ub24/ub24.4-1.vmx
+root@pve:~# ls -alh /tmp/esxi_v2v_ub24                      # 以下情况是这台vm还在开着机,所以上面报错了
+total 45G
+drwxr-xr-x  1 root root 4.0K May 25 20:57 .
+drwxrwxrwt 11 root root 4.0K May 25 21:37 ..
+-rwxrwxr-x  1 root root   92 May 25 21:38 .lck-0200080000000000
+-rwxrwxr-x  1 root root   92 May 25 21:38 .lck-0500080000000000
+-rwxrwxr-x  1 root root   92 May 25 21:38 .lck-0700080000000000
+-rwxrwxr-x  1 root root   92 May 25 21:38 .lck-1000080000000000
+-rw-------  1 root root 4.0G May 25 20:57 ub24.4-1-0c575239.vswp
+-rw-r--r--  1 root root 7.3K May 25 20:57 ub24.4-1-1.scoreboard
+-rw-------  1 root root  40G May 25 21:37 ub24.4-1-flat.vmdk
+-rw-------  1 root root 265K May 25 20:57 ub24.4-1.nvram
+-rw-r--r--  1 root root 7.3K May 25 12:57 ub24.4-1.scoreboard
+-rw-------  1 root root  474 May 25 20:57 ub24.4-1.vmdk
+-rw-r--r--  1 root root    0 May 25 18:20 ub24.4-1.vmsd
+-rwxr-xr-x  1 root root 3.1K May 25 20:57 ub24.4-1.vmx
+-rw-------  1 root root    0 May 25 20:57 ub24.4-1.vmx.lck
+-rw-r--r--  1 root root 211K May 25 20:57 vmware-1.log
+-rw-r--r--  1 root root 142K May 25 21:32 vmware.log
+-rw-------  1 root root  82M May 25 20:57 vmx-ub24.4-1-c67e44cc1e16ca8270b9b6417c355f1d2ec2fd913e97f4a8e4c99546aab7b22f-1.vswp
+
+# 在pve节点上查看, 以下情况才是关机的状态
+root@pve:~# ls -alh /tmp/esxi_v2v_ub24
+total 41G
+drwxr-xr-x  1 root root 4.0K May 25 21:38 .
+drwxrwxrwt 11 root root 4.0K May 25 21:37 ..
+-rw-r--r--  1 root root 7.3K May 25 20:57 ub24.4-1-1.scoreboard
+-rw-------  1 root root  40G May 25 21:37 ub24.4-1-flat.vmdk
+-rw-------  1 root root 265K May 25 20:57 ub24.4-1.nvram
+-rw-r--r--  1 root root 7.3K May 25 21:38 ub24.4-1.scoreboard
+-rw-------  1 root root  474 May 25 20:57 ub24.4-1.vmdk
+-rw-r--r--  1 root root    0 May 25 18:20 ub24.4-1.vmsd
+-rwxr-xr-x  1 root root 3.1K May 25 21:38 ub24.4-1.vmx
+-rw-r--r--  1 root root 211K May 25 20:57 vmware-1.log
+-rw-r--r--  1 root root 160K May 25 21:38 vmware.log
+
+# 然后再看是迁移
+root@pve:~# virt-v2v -i vmx "/tmp/esxi_v2v_ub24/ub24.4-1.vmx" -o local -os /mnt/pve/nfs-shared-storage1/images/100  -of  raw --bandwidth 50M
+[   0.0] Setting up the source: -i vmx /tmp/esxi_v2v_ub24/ub24.4-1.vmx
+[   1.0] Opening the source
+[   4.4] Inspecting the source
+[  18.0] Checking for sufficient free disk space in the guest
+[  18.0] Converting Ubuntu 24.04.1 LTS to run on KVM
+virt-v2v: warning: could not determine a way to update the configuration of 
+Grub2
+virt-v2v: error: libguestfs error: file_architecture: unknown architecture: 
+/usr/lib/modules/6.17.0-29-generic/kernel/arch/x86/kvm/kvm.ko.zst
+
+If reporting bugs, run virt-v2v with debugging enabled and include the 
+complete output:
+
+  virt-v2v -v -x [...]
+
+报错分析:
+这个报错直接戳中了 virt-v2v 引擎在2026年面对全新linux发行版(如Ubuntu 24.04及后续版本)时的一个底层静态解析内核漏洞
+用第一性原理来解剖这个报错：file_architecture: unknown architecture: .../kvm.ko.zst
+新版内核的压缩算法变了: Ubuntu 24.04引入了非常激进的内核优化，将其所有的内核模块(.ko文件)全部采用了ZSTD (.zst) 算法进行高压缩
+工具链老旧无法识别: pve 宿主机上的 libguestfs-tools(也就是virt-v2v依赖的底层文件系统解剖工具)在解析内核架构时，使用的是经典的 file 命令或者早期的魔术字(Magic Number)扫描。它只认识.ko(未压缩)或者 .ko.gz(Gzip压缩)
+彻底抓瞎： 当它扫描到 /.../kvm.ko.zst 时，由于无法就地解压并读取这个 ELF 文件的内核架构标记（x86_64），它直接判定为 unknown architecture 并抛出致命异常闪退
+在现场给客户处理问题时，如果卡在这一步，我们不需要等待官方更新补丁，我们直接降维打击，绕过 virt-v2v 脆弱的内核扫描
+既然virt-v2v的"医生功能"在Ubuntu 24.04的ZSTD内核面前瘫痪了，那就只用它来做最纯粹的数据传输(Data Copy)，强制跳过内核转换
+对于老旧的 CentOS 6/7 或者早期的 Windows，我们必须用 virt-v2v 去注入 VirtIO 驱动，否则开机必定蓝屏或找不到盘。
+
+Ubuntu 24.04 是2024年以后发布的现代主流系统，它的标准主流内核(6.8+)在出厂时，早就已经把原生的 KVM VirtIO 驱动(包括virtio_blk、virtio_scsi、virtio_net)硬焊进内核核心了！ 它根本不需要 virt-v2v 去人工注入
+
+# 下条命令中不是 -flat.vmdk, 是直接的.vmdk
+root@pve:~# qemu-img convert -p -f vmdk -O raw  /tmp/esxi_v2v_ub24/ub24.4-1.vmdk  /mnt/pve/nfs-shared-storage1/images/100/vm-100-disk-0.raw
+    (100.00/100%)
+
+
+# 方法1
+在pve终端强行给vm 100 注入UEFI固件并把引用的EFI盘直接格式化在NFS上：
+root@pve:~# qm set 100 --bios ovmf --efidisk0 nfs-shared-storage1:0,format=raw,pre-enrolled=0
+
+# 方法2(我使用的该方法)
+因为我是先创建的空vm,所以会用下图的方式修改
+```
+![image](./images/68.png)
+![image](./images/69.png)
+![image](./images/70.png)
+![image](./images/71.png)
+
+
+```shell
+# 方法3  如果你还没有创建空vm则:
+点击 PVE 右上角的 Create VM(创建虚拟机)
+切换到第三个标签页System(系统)
+找到 BIOS 这一行，默认是 Default (SeaBIOS)，点击下拉菜单，将其修改为 OVMF (UEFI)
+选成OVMF(UEFI) 后，下方会立刻弹出一个EFI Storage的下拉框，必须在这里选择你的存储卷(比如你的nfs-shared-storage1)，用来存放UEFI的非易失性变量(NVRAM)
+取消勾选 Pre-Enroll keys(除非你的Ubuntu启用了安全启动 Secure Boot，一般企业迁移都不勾选，防止密钥不匹配死锁)
+
+
+无论使用上述3种方法中的哪种，都需要让pve强制重新扫描并捡起这个.raw硬盘
+root@pve:~# qm rescan --vmid 100
+rescan volumes...
+VM 100 add unreferenced volume 'nfs-shared-storage1:100/vm-100-disk-0.raw' as 'unused0' to config
+
+用命令挂载并强行绑定引导顺序
+root@pve:~# qm set 100 --scsi0 nfs-shared-storage1:100/vm-100-disk-0.raw,discard=on && qm set 100 --boot order=scsi0
+命令释义:
+--scsi0：将磁盘挂载到VirtIO SCSI控制器的0号通道上，这是pve下性能最强、延迟最低的块设备通道
+discard=on：开启回收空白块特性。因为我用的是raw格式，开启这个后，未来你在 Ubuntu 24内部执行fstrim，nfs存储端会自动释放被删除文件占用的物理空间，防止存储虚胖
+--boot order=scsi0：直接重写虚拟机的配置文件，强行把scsi0顶到最前面，压制住新建的那个空壳EFI盘
+
+或者在图形化中挂载并强行绑定引导顺序(本次用该方法)
+```
+![image](./images/72.png)
+![image](./images/73.png)
+![image](./images/74.png)
+![image](./images/75.png)
+![image](./images/76.png)
+
 
 
 
