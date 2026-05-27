@@ -233,6 +233,53 @@ virt-v2v具备影子转换特性：
 
 
 
+遇到大容量虚拟机(超过500GB)迁移开工前必须主动向客户的IT主管确认："当前迁移网路是否为隔离网络？是否需要做带宽控制？"
+若对方答"需要"，立刻使用 sshfs -o speedlimit=51200 或者是 virt-v2v --bandwidth 50M 进行限速
+这很大程度上能彻底杜绝因为迁移导致断网的生产事故
+
+
+# 极致限速与带宽控制(加固部分)
+一、 核心第一性原理：为什么要搞"极致限速"？
+在2026年的中小企业生产环境中，很多公司的网络并不是高大上的独立万兆隔离网络，而是"业务、存储、迁移流量混跑在同一套交换机/千兆网线"上
+当你使用 qemu-img convert 或者是 virt-v2v 开始抽干一台1TB的虚拟机磁盘时，这些工具的默认行为是"有多少带宽就吃多少带宽，以最极限的速度读写"
+这会带来两个灾难性后果：
+网络瘫痪(白天): 迁移流量瞬间把核心交换机的网口塞满，导致企业员工打不开ERP、网页打不开，造成生产事故
+存储死锁(晚上): 如果数据终点是诸如 Debian NFS 共享存储，瞬间几十上百兆的并发写入流会直接把NFS机械硬盘组的I/O队列拉满(IOPS爆表)，导致整个存储卡死失联
+因此，控制迁移过程中的数据流速，既是保护客户生产环境的“护城河”，也是自由职业者体现专业度、避免被动排错的关键
+
+二、 具体方案含义：两条腿走路
+根据客户的实际生产业务要求，主要分为两种限速控制手段：
+1. 压榨流(全网停机，极速割接)
+含义: 客户允许在周六凌晨0:00-4:00彻底停机割接，此时全公司没人用网
+战术: 彻底解除所有速度限制。如果两边物理网卡支持，在PVE和物理交换机上开启 MTU 9000(巨型帧Jumbo Frames)，减少网络封包解包的CPU损耗，让千兆/万兆带宽跑满
+
+2. 润物细无声流(在线热传/白天传输，精细限速)
+含义: 客户要求白天上班时间就把1TB的大盘从esxi传到pve存储上，晚上直接开机，且传输期间绝对不能影响员工用网
+战术: 利用底层管道工具(如sshfs、virt-v2v)内置的限速算法，将流量死死压在物理带宽的30%-50%以下
+
+三、 完整实施流程 SOP（人肉自由职业者稳健版）
+结合该文档中的架构，我们已把esxi上的虚拟机磁盘通过网络转存到PVE挂载的 nfs-shared-storage1 上为例
+流程 A：使用 virt-v2v 内置的流式限速(推荐，最省心)
+如果你采用的是virt-v2v，它原生自带了一个极度好用的参数 --bandwidth
+完整操作：
+登录 PVE-Node-02 命令行
+假定客户的千兆网络理论极限速度是125MB/s。为了不影响业务，你打算将其限制在50MB/s(即400Mbps左右)，执行以下命令：
+virt-v2v -i vmx "/tmp/esxi_v2v/rocky8.5.vmx" -o local -os /mnt/pve/nfs-shared-storage1/images/102 -of qcow2 --bandwidth 50M
+底层原理: virt-v2v 调用底层的 nbdcopy 在内存中传输数据块时，会强行加入时间片延迟。当检测到当前秒的数据量达到50MB时，立刻暂停向NFS写入，直到下一秒开始。这让NFS存储读写曲线极其平稳，绝不会高拉垮客户的交换机
+
+流程 B：使用 sshfs 物理通道限速(容错率100%的万能流)
+如果有些极老旧系统你无法使用 virt-v2v，只能采用qemu-img纯数据流硬转，但 qemu-img convert 默认是没有限速功能的。这时就要在挂载源头(网络管道)上做手术
+完整操作：
+用 sshfs 挂载 ESXi 的存储卷，并直接在挂载命令中下达限速死命令：
+# 创建临时挂载点
+mkdir -p /tmp/esxi_v2v
+# 物理限速：-o speedlimit=51200 代表将这个挂载点的网络读取速度死死锁在50MB/s (51200KB/s)
+sshfs -o speedlimit=51200 root@192.168.2.122:/vmfs/volumes/datastore1 /tmp/esxi_v2v
+执行硬核倒盘：
+# 此时哪怕 qemu-img 用尽全身力气去读，由于上层 sshfs 管道被掐住了脖子，它最高也只能跑 50MB/s
+qemu-img convert -p -f vmdk -O raw /tmp/esxi_v2v/rocky8.5/rocky8.5-flat.vmdk /mnt/pve/nfs-shared-storage1/images/101/vm-101-disk-0.raw
+底层原理： 这是典型的"流量整形(Traffic Shaping)"。通过在挂载层对 SSH 的 TCP 窗口进行限制，强行拉大网络延迟，从而完美保护了客户现有的生产网络
+
 
 
 ```
@@ -467,6 +514,9 @@ systemctl restart pvedaemon pveproxy pvestatd
 用以下方法验证是否合格:
 在ESXi的ESXi-NFS-Share里随便上传一个ISO
 登录PVE-Node-01的终端，查看ls /mnt/pve/nfs-shared-storage/template/iso/。如果你能在PVE里面看到刚刚在ESXi里上传的那个iso文件，说明两家虚拟化巨头已经共用了一个物理心脏
+
+镜像必须放在 /mnt/pve/nfs-shared-storage/template/iso/ 中
+
 ```
 ![image](./images/19.png)
 ![image](./images/20.png)
@@ -581,7 +631,7 @@ crw-rw-rw- 1 root root 119, 8  5月 23 05:20 /dev/vmnet8
 
 
 
-方法4: 管道级 --- 边传、边转、边写
+方法4: 管道级 --- 边传、边转、边写 (该方法已失效)
 如果VMware 和 PVE 处于不同的物理机房，磁盘必须跨网络传输则绝对不能先用scp下到本地再转
 要用Linux管道(pipe)结合ssh和qemu-img，让数据变成流。在pve终端执行一行命令：
 ssh root@esxi-ip "cat /vmfs/volumes/datastore1/vm/disk.vmdk" | qemu-img convert -f vmdk -O qcow2 /dev/stdin /var/lib/vz/images/101/vm-101-disk-0.qcow2
@@ -1122,7 +1172,8 @@ virt-v2v在准备向你的NFS写入最终数据时，调用了Linux底层的 NBD
 root@pve:~# mkdir -p /tmp/esxi_v2v
 root@pve:~# mkdir -p /mnt/pve/nfs-shared-storage1/images/102
 root@pve:~# sshfs -o allow_other,idmap=user root@192.168.2.122:/vmfs/volumes/eca5bd35-3a696585/rocky8.5    /tmp/esxi_v2v
-注:2.122是esxi地址
+注: 2.122是esxi地址
+
 
 root@pve:~# df -Th | egrep '(esxi|mnt)'
 192.168.2.113:/mnt/nfs_shares/pve_storage                   nfs4         20G   16G  2.8G  86% /mnt/pve/nfs-shared-storage
@@ -1130,7 +1181,7 @@ root@pve:~# df -Th | egrep '(esxi|mnt)'
 root@192.168.2.122:/vmfs/volumes/eca5bd35-3a696585/rocky8.5 fuse.sshfs   59G   21G   36G  37% /tmp/esxi_v2v
 
 
-# 下一条命令virt-v2v -v -x -i...可查看执行中的日志
+# 下一条命令virt-v2v -v -x -i...可查看执行中的日志(--bandwidth是限速为50M)
 root@pve:~# virt-v2v -i vmx "/tmp/esxi_v2v/rocky8.5.vmx" -o local -os /mnt/pve/nfs-shared-storage1/images/102 -of qcow2 --bandwidth 50M
 [   0.0] Setting up the source: -i vmx /tmp/esxi_v2v/rocky8.5.vmx
 [   1.0] Opening the source
@@ -1388,10 +1439,420 @@ discard=on：开启回收空白块特性。因为我用的是raw格式，开启�
 
 
 
+# CentOS7.x传统BIOS传统网卡迁移
+```shell
+2026年海外有无数中小企业的边缘业务还在跑CentOS7。这类系统迁移最容易卡死在"网卡规则锁定(udev)" 和 "旧版Initramfs缺少VirtIO驱动"上
+1. 手动注入VirtIO驱动：
+如果用qemu-img硬转CentOS7，开机通常会报error: no such device 或者直接挂载不进根目录。所以必须通过挂载ISO进入救援模式(Rescue Mode)强行把VirtIO模块塞进旧内核：
+dracut --force --add-drivers "virtio virtio_prio virtio_ring virtio_pci virtio_scsi virtio_blk" /boot/initramfs-$(uname -r).img $(uname -r)
+
+2. 清理HWADDR(硬件MAC地址绑定):
+CentOS7极度喜欢把旧网卡的MAC地址写死在 /etc/sysconfig/network-scripts/ifcfg-eth0 里的HWADDR= 这一行。迁移到pve后，网卡MAC变了，网络绝对死活不通。所以必须上强行删掉HWADDR这一行的规范
+
+```
+
+
+
+## 实操centos7单盘
+![image](./images/77.png)
+![image](./images/78.png)
+![image](./images/79.png)
+<font color=red>**迁移前记得把centos7关机**</font>
+```shell
+root@pve:~# mkdir /tmp/esxi_v2v_centos7
+
+# 查看nfs挂载过来的盘
+root@pve:~# ls -alh /mnt/pve/nfs-shared-storage1/centos7.9-1/
+total 2.4G
+drwxr-xr-x 2 root root 4.0K May 26  2026 .
+drwxr-xr-x 6 root root 4.0K May 26  2026 ..
+-rw------- 1 root root  40G May 26  2026 centos7.9-1-flat.vmdk
+-rw------- 1 root root 8.5K May 26  2026 centos7.9-1.nvram
+-rw-r--r-- 1 root root 7.3K May 26  2026 centos7.9-1.scoreboard
+-rw------- 1 root root  531 May 26  2026 centos7.9-1.vmdk
+-rw-r--r-- 1 root root    0 May 26  2026 centos7.9-1.vmsd
+-rwxr-xr-x 1 root root 3.5K May 26  2026 centos7.9-1.vmx
+-rw-r--r-- 1 root root 183K May 26  2026 vmware.log
+
+root@pve:~# mkdir -p /mnt/pve/nfs-shared-storage1/images/101
+root@pve:~# ssh root@192.168.2.122 "vim-cmd vmsvc/getallvms"
+(root@192.168.2.122) Password: 
+Vmid      Name                           File                           Guest OS       Version   Annotation
+8      centos7.9-1   [ESXI-NFS-Share1] centos7.9-1/centos7.9-1.vmx   centos7_64Guest   vmx-21  
+
+root@pve:~# ssh root@192.168.2.122 "ls -alh /vmfs/volumes/"
+(root@192.168.2.122) Password: 
+total 1548
+drwxr-xr-x    1 root     root         512 May 25 15:48 .
+drwxr-xr-x    1 root     root         512 May 24 07:36 ..
+drwxr-xr-x    1 root     root           8 Jan  1  1970 26ebbad0-04481ffe-1094-c6d5b5452ea0
+drwxr-xr-t    1 root     root       76.0K May 23 07:25 6a11563f-e8acc822-7f9f-000c29d7ea74
+lrwxr-xr-x    1 root     root          35 May 25 15:48 BOOTBANK1 -> 26ebbad0-04481ffe-1094-c6d5b5452ea0
+lrwxr-xr-x    1 root     root          35 May 25 15:48 BOOTBANK2 -> bc6b9068-4e474bd7-f9bf-ca916110a32c
+lrwxr-xr-x    1 root     root          17 May 25 15:48 ESXI-NFS-Share1 -> eca5bd35-3a696585
+lrwxr-xr-x    1 root     root          17 May 25 15:48 ESXi-NFS-Share -> c2d6a58c-fb7a181e
+lrwxr-xr-x    1 root     root          35 May 25 15:48 OSDATA-6a11563f-e8acc822-7f9f-000c29d7ea74 -> 6a11563f-e8acc822-7f9f-000c29d7ea74
+drwxr-xr-x    1 root     root           8 Jan  1  1970 bc6b9068-4e474bd7-f9bf-ca916110a32c
+drwxrwxrwx    5 65534    65534       4.0K May 24 02:19 c2d6a58c-fb7a181e
+drwxr-xr-x    6 root     root        4.0K May 26  2026 eca5bd35-3a696585
+
+root@pve:~# sshfs -o allow_other,idmap=user root@192.168.2.122:/vmfs/volumes/eca5bd35-3a696585/centos7.9-1     /tmp/esxi_v2v_centos7
+root@pve:~# df -Th | grep centos
+root@192.168.2.122:/vmfs/volumes/eca5bd35-3a696585/centos7.9-1 fuse.sshfs   59G  2.4G   54G   5% /tmp/esxi_v2v_centos7
+
+root@pve:~# qemu-img convert -p -f vmdk -O raw   /tmp/esxi_v2v_centos7/centos7.9-1.vmdk    /mnt/pve/nfs-shared-storage1/images/101/vm-101-disk-0.raw
+    (100.00/100%)
+
+root@pve:~# ls -alh /mnt/pve/nfs-shared-storage1/images/101/vm-101-disk-0.raw
+-rw-r--r-- 1 root root 40G May 26  2026 /mnt/pve/nfs-shared-storage1/images/101/vm-101-disk-0.raw
+
+# 让pve强制重新扫描vm 102的目录，刷新注册表
+root@pve:~# qm rescan --vmid 101
+rescan volumes...
+VM 101 add unreferenced volume 'nfs-shared-storage1:101/vm-101-disk-0.raw' as 'unused0' to config
+
+```
+![image](./images/80.png)
+![image](./images/81.png)
+![image](./images/82.png)
+![image](./images/83.png)
+![image](./images/84.png)
+![image](./images/85.png)
+![image](./images/86.png)
+![image](./images/87.png)
+![image](./images/88.png)
+
+```shell
+sh-4.2# dracut --force --add-drivers "virtio virtio_pci virtio_ring virtio_scsi virtio_blk" /boot/initramfs-3.10.0-1160.el7.x86_64.img 3.10.0-1160.el7.x86_64
+
+sh-4.2# grub2-mkconfig -o /boot/grub2/grub.cfg
+sh-4.2# exit
+sh-4.2# exit
+```
+![image](./images/89.png)
+<font color=red>**按2次exit退出，关机，设置第一启动项从硬盘启动**</font>
+![image](./images/90.png)
+
+
+
+
+## 实操centos7 多盘
+![image](./images/91.png)
+![image](./images/92.png)
+
+```shell
+root@pve:~# mkdir /tmp/esxi_v2v_centos7_duopan
+root@pve:~# mkdir -p /mnt/pve/nfs-shared-storage1/images/100
+root@pve:~# ssh root@192.168.2.122 "vim-cmd vmsvc/getallvms"
+(root@192.168.2.122) Password: 
+Vmid         Name                                  File                                Guest OS       Version   Annotation
+8      centos7.9-1        [ESXI-NFS-Share1] centos7.9-1/centos7.9-1.vmx             centos7_64Guest   vmx-21              
+9      centos7.9-duopan   [ESXI-NFS-Share1] centos7.9-duopan/centos7.9-duopan.vmx   centos7_64Guest   vmx-21  
+
+
+root@pve:~# ssh root@192.168.2.122 "ls -alh /vmfs/volumes/"
+(root@192.168.2.122) Password: 
+total 1548
+drwxr-xr-x    1 root     root         512 May 25 19:20 .
+drwxr-xr-x    1 root     root         512 May 24 07:36 ..
+drwxr-xr-x    1 root     root           8 Jan  1  1970 26ebbad0-04481ffe-1094-c6d5b5452ea0
+drwxr-xr-t    1 root     root       76.0K May 23 07:25 6a11563f-e8acc822-7f9f-000c29d7ea74
+lrwxr-xr-x    1 root     root          35 May 25 19:20 BOOTBANK1 -> 26ebbad0-04481ffe-1094-c6d5b5452ea0
+lrwxr-xr-x    1 root     root          35 May 25 19:20 BOOTBANK2 -> bc6b9068-4e474bd7-f9bf-ca916110a32c
+lrwxr-xr-x    1 root     root          17 May 25 19:20 ESXI-NFS-Share1 -> eca5bd35-3a696585
+lrwxr-xr-x    1 root     root          17 May 25 19:20 ESXi-NFS-Share -> c2d6a58c-fb7a181e
+lrwxr-xr-x    1 root     root          35 May 25 19:20 OSDATA-6a11563f-e8acc822-7f9f-000c29d7ea74 -> 6a11563f-e8acc822-7f9f-000c29d7ea74
+drwxr-xr-x    1 root     root           8 Jan  1  1970 bc6b9068-4e474bd7-f9bf-ca916110a32c
+drwxrwxrwx    5 65534    65534       4.0K May 26  2026 c2d6a58c-fb7a181e
+drwxr-xr-x    7 root     root        4.0K May 26  2026 eca5bd35-3a696585
+root@pve:~# ssh root@192.168.2.122 "ls -alh /vmfs/volumes/eca5bd35-3a696585"
+(root@192.168.2.122) Password: 
+total 36
+drwxr-xr-x    7 root     root        4.0K May 26  2026 .
+drwxr-xr-x    1 root     root         512 May 25 19:20 ..
+drwxr-xr-x    2 root     root        4.0K May 26  2026 centos7.9-1
+drwxr-xr-x    2 root     root        4.0K May 26  2026 centos7.9-duopan
+drwxr-xr-x    4 root     root        4.0K May 26  2026 images
+drwx------    2 root     root       16.0K May 24 02:26 lost+found
+drwxr-xr-x    4 root     root        4.0K May 24 13:03 template
+root@pve:~# sshfs -o allow_other,idmap=user root@192.168.2.122:/vmfs/volumes/eca5bd35-3a696585/centos7.9-duopan     /tmp/esxi_v2v_centos7_duopan
+root@pve:~# df -Th | grep centos
+root@192.168.2.122:/vmfs/volumes/eca5bd35-3a696585/centos7.9-1      fuse.sshfs   59G  6.3G   50G  12% /tmp/esxi_v2v_centos7
+root@192.168.2.122:/vmfs/volumes/eca5bd35-3a696585/centos7.9-duopan fuse.sshfs   59G  6.3G   50G  12% /tmp/esxi_v2v_centos7_duopan
+
+root@pve:~# ls /tmp/esxi_v2v_centos7_duopan/*.vmdk | grep -v flat
+/tmp/esxi_v2v_centos7_duopan/centos7.9-duopan_1.vmdk
+/tmp/esxi_v2v_centos7_duopan/centos7.9-duopan_2.vmdk
+/tmp/esxi_v2v_centos7_duopan/centos7.9-duopan.vmdk
+注:
+centos7.9-duopan.vmdk (系统盘，对应块描述索引)
+centos7.9-duopan_1.vmdk (数据盘1)
+centos7.9-duopan_2.vmdk (数据盘2)
+
+# 精准导出系统盘 (scsi0)
+root@pve:~# qemu-img convert -p -f vmdk -O raw   /tmp/esxi_v2v_centos7_duopan/centos7.9-duopan.vmdk    /mnt/pve/nfs-shared-storage1/images/100/vm-100-disk-0.raw
+# 精准倒出第一块数据盘 (scsi1)
+root@pve:~# qemu-img convert -p -f vmdk -O raw /tmp/esxi_v2v_centos7_duopan/centos7.9-duopan_1.vmdk /mnt/pve/nfs-shared-storage1/images/100/vm-100-disk-1.raw
+# 精准倒出第二块数据盘 (scsi2)
+root@pve:~# qemu-img convert -p -f vmdk -O raw /tmp/esxi_v2v_centos7_duopan/centos7.9-duopan_2.vmdk /mnt/pve/nfs-shared-storage1/images/100/vm-100-disk-2.raw
+
+root@pve:~# ls -alh /mnt/pve/nfs-shared-storage1/images/100/
+total 1.5G
+drwxr-xr-x 2 root root 4.0K May 26  2026 .
+drwxr-xr-x 4 root root 4.0K May 26 14:42 ..
+-rw-r--r-- 1 root root  40G May 26 16:18 vm-100-disk-0.raw
+-rw-r--r-- 1 root root  10G May 26  2026 vm-100-disk-1.raw
+-rw-r--r-- 1 root root  16G May 26  2026 vm-100-disk-2.raw
+
+转换完成后，在PVE网页端建好空壳vm,并用命令重新扫描id是100的这个vm
+root@pve:~# qm rescan --vmid 100
+rescan volumes...
+VM 100 add unreferenced volume 'nfs-shared-storage1:100/vm-100-disk-0.raw' as 'unused0' to config
+VM 100 add unreferenced volume 'nfs-shared-storage1:100/vm-100-disk-1.raw' as 'unused1' to config
+VM 100 add unreferenced volume 'nfs-shared-storage1:100/vm-100-disk-2.raw' as 'unused2' to config
+
+去id是100的这台vm的Hardware里把:
+unused0 改为 scsi0
+unused1 改为 scsi1
+unused2 改为 scsi2
+
+在这台机的"选项" --> "引导顺序" 中把scsi0改成第一启动项，然后启动该vm
+
+报错如下:
+```
+
+![image](./images/84.png)
+![image](./images/85.png)
+![image](./images/86.png)
+![image](./images/87.png)
+```shell
+解决CentOS7救援模式dracut报错
+sh-4.2# dracut --force --add-drivers "virtio virtio_pci virtio_ring virtio_scsi virtio_blk" /boot/initramfs-$(uname -r).img  $(uname -r)
+
+sh-4.2# grub2-mkconfig -o /boot/grub2/grub.cfg
+sh-4.2# exit
+sh-4.2# poweroff           # 重新设置第一启动项从硬盘启动
+```
+![image](./images/88.png)
+![image](./images/94.png)
+![image](./images/95.png)
 
 
 
 
 
 
+## 实操centos7 LVM
+```shell
+在企业级生产环境中，多盘(Multi-disk)结合LVM(逻辑卷管理)是Linux服务器的标准配置。通过 qemu-img 纯数据流硬转这类系统时，最核心的第一性原理是：
+保证底层物理块设备(Disks)的完整映射与数量对齐，再进入系统内部激活逻辑卷层
+第一阶段：源端（ESXi）数据链路解剖与导出
+假设你在客户的 ESXi 上遇到一台核心虚拟机（VM ID 105），挂载了 3 块盘：系统盘（40G）、数据盘（200G）、日志盘（100G），并且在系统内组合成了 LVM。
 
+
+系统盘-->ub22.vmdk (对应 sda)
+数据盘1--> ub22_1.vmdk (对应 sdb)
+数据盘2 --> ub22_2.vmdk (对应 sdc)
+# 创建lvs
+# 1. 在 vg0 卷组中创建一个名为 data-lv 的逻辑卷，使用 100% 的剩余空间
+sudo lvcreate -l 100%FREE -n data-lv vg0
+
+# 2. 用 ext4 文件系统格式化这个新创建的逻辑卷
+sudo mkfs.ext4 /dev/mapper/vg0-data--lv
+
+# 3. 创建一个挂载点目录，并将它挂载上去
+sudo mkdir -p /data
+sudo mount /dev/mapper/vg0-data--lv /data
+
+# 4. 写入一些商业假数据，用于后期迁移后肉眼比对数据完整性
+echo "LVM multi-disk transfer test data 2026" | sudo tee /data/prod_db.txt
+echo "what are you doing" | tee 1.txt
+
+# 5. 实现开机自动挂载（防止迁移后开机挂载丢失）
+# echo '/dev/mapper/vg0-data--lv  /data  ext4  defaults  0  2' | sudo tee -a /etc/fstab
+
+# 6. 验证挂载是否成功
+df -Th | grep data
+rambo@ub22:~$ df -Th
+Filesystem                        Type   Size  Used Avail Use% Mounted on
+tmpfs                             tmpfs  392M  1.2M  391M   1% /run
+/dev/mapper/ubuntu--vg-ubuntu--lv ext4    19G  7.0G   11G  41% /
+tmpfs                             tmpfs  2.0G     0  2.0G   0% /dev/shm
+tmpfs                             tmpfs  5.0M     0  5.0M   0% /run/lock
+/dev/sda2                         ext4   2.0G  134M  1.7G   8% /boot
+/dev/sda1                         vfat   1.1G  6.1M  1.1G   1% /boot/efi
+tmpfs                             tmpfs  392M  4.0K  392M   1% /run/user/1000
+/dev/mapper/vg0-data--lv          ext4    25G   28K   24G   1% /data
+
+
+# 多盘同步纯数据流转换
+虚拟机在esxi关机后，直接通过nfs共享目录，在PVE终端使用 qemu-img 分别将三块盘独立转换出来，假设新 VM ID 规划为 100：
+PVE 建立空壳并强制刷新注册表
+网页端创建空壳 VM 100:
+BIOS: 必须修改为OVMF(UEFI)并添加EFI Disk
+Machine: 选 q35
+Disks: 删掉自带的默认盘
+
+# 在pve端创建VM 100 的图片目录
+root@pve:~# mkdir -p /mnt/pve/nfs-shared-storage1/images/100
+
+# 在pve端转换sda(系统盘)
+root@pve:~# qemu-img convert -p -f raw -O raw /mnt/pve/nfs-shared-storage1/ub22.04-1/ub22.04-1-flat.vmdk   /mnt/pve/nfs-shared-storage1/images/100/vm-100-disk-0.raw
+
+# 转换sdb(盘1)
+root@pve:~# qemu-img convert -p -f raw -O raw /mnt/pve/nfs-shared-storage1/ub22.04-1/ub22.04-1_1-flat.vmdk  /mnt/pve/nfs-shared-storage1/images/100/vm-100-disk-1.raw
+
+# 转换sdc(盘2)
+root@pve:~# qemu-img convert -p -f raw -O raw /mnt/pve/nfs-shared-storage1/ub22.04-1/ub22.04-1_2-flat.vmdk  /mnt/pve/nfs-shared-storage1/images/100/vm-100-disk-2.raw
+
+在PVE命令行强制让内核重新扫描这3块塞进去的盘：
+root@pve:~# qm rescan --vmid 100
+rescan volumes...
+VM 100 add unreferenced volume 'nfs-shared-storage1:100/vm-100-disk-0.raw' as 'unused0' to config
+VM 100 add unreferenced volume 'nfs-shared-storage1:100/vm-100-disk-1.raw' as 'unused1' to config
+VM 100 add unreferenced volume 'nfs-shared-storage1:100/vm-100-disk-2.raw' as 'unused2' to config
+此时网页端的 Hardware 会蹦出三个黄色图标：Unused Disk 0, Unused Disk 1, Unused Disk 2
+
+在 PVE 网页端双击这三块盘进行添加，这里的总线顺序绝对不能错：
+Unused Disk 0 (系统盘) --> 挂载为 scsi0
+Unused Disk 1 (10G盘) -->  挂载为 scsi1
+Unused Disk 2 (15G盘) --> 挂载为 scsi2
+磁盘控制器统一选择 VirtIO SCSI single
+
+尽管LVM具备通过UUID自动识别底层物理卷(PV)的能力，但如果把盘符顺序插反(例如把sdc挂到了scsi1)，导致Linux内核层面的盘符发生颠倒
+虽然LVM能拉起来，但如果你原系统中有其他非LVM分区(比如硬写死在/etc/fstab里的/dev/sdb)就会导致开机直接卡死在挂载错误界面
+
+引导排序、通电与开机验证在VM 100 --> Options --> Boot Order中，只勾选scsi0并拖到第一位。开机启动，进入系统控制台
+添加efi磁盘: 在VM 100 -->  硬件 --> 添加 --> EFI磁盘 --> 磁盘存储选nfs-shared-storage1，格式我选的"原始磁盘映像(raw)"
+
+```
+![image](./images/96.png)
+> 原来的磁盘是efi模式，如果到新机器上后使用了SeaBIOS则会出现以下报错，所以才需要下面2张图
+seabios(version rel1.16....)
+machine uuid 1b4fc...
+Booting from hard disk... 
+
+
+![image](./images/97.png)
+![image](./images/98.png)
+
+```shell
+# 开机后大概会没有IP，所以需要先修改配置来解决ip问题
+ip a 来确定网卡名，本次是看到的是ens18，但原来的是ens33
+cd /etc/netplan/ 除了50-cloud-init.yaml外，把其他杂七杂八的 .yaml 文件全部删掉，或者挪到 /tmp 备份，防止它们多头管理、互相冲突
+查看systemd-networkd服务的状态，本次是running的状态，如你使用的是NetworkManager则应确保NetworkManager是running的状态
+sudo vim 50-cloud-init.yaml
+network:
+  version: 2
+  renderer: networkd          # 因为使用的是systemd-networkd所以需要是networkd, 也可是NetworkManager
+  ethernets:
+    ens18:
+      dhcp4: true
+
+# ================== 固定IP的写法 ========================
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    ens18:
+      dhcp4: false
+      addresses:
+        - 192.168.2.146/24
+      nameservers:
+        addresses:
+          - 192.168.2.1
+          - 8.8.8.8
+      routes:
+        - to: default
+          via: 192.168.2.1
+# ===============================================
+强行让 Netplan 重新根据 50-cloud-init.yaml 生成 networkd 后端配置文件：
+sudo netplan generate       # 无报错则说明语法完全通过
+
+绕过 netplan apply，直接在底层重启真正干活的网络服务，让它强行就地加载新配置：
+sudo systemctl restart systemd-networkd
+
+再次查看ip
+ip a show ens18
+ping -c3 qq.com
+
+
+查看LVM架构是否完好自动激活
+rambo@ub22:~$ sudo pvs
+  PV         VG        Fmt  Attr PSize   PFree 
+  /dev/sda3  ubuntu-vg lvm2 a--  <36.95g 18.47g
+  /dev/sdb   vg0       lvm2 a--  <10.00g     0 
+  /dev/sdc   vg0       lvm2 a--  <15.00g     0 
+
+rambo@ub22:~$ sudo vgs
+  VG        #PV #LV #SN Attr   VSize   VFree 
+  ubuntu-vg   1   1   0 wz--n- <36.95g 18.47g
+  vg0         2   1   0 wz--n-  24.99g     0 
+
+rambo@ub22:~$ sudo lvs
+  LV        VG        Attr       LSize  Pool Origin Data%  Meta%  Move Log Cpy%Sync Convert
+  ubuntu-lv ubuntu-vg -wi-ao---- 18.47g                                                    
+  data-lv   vg0       -wi-a----- 24.99g 
+
+# 查看挂载和数据
+rambo@ub22:~$ df -Th
+Filesystem                        Type   Size  Used Avail Use% Mounted on
+tmpfs                             tmpfs  391M  1.1M  390M   1% /run
+/dev/mapper/ubuntu--vg-ubuntu--lv ext4    19G  7.2G   10G  43% /
+tmpfs                             tmpfs  2.0G     0  2.0G   0% /dev/shm
+tmpfs                             tmpfs  5.0M     0  5.0M   0% /run/lock
+/dev/sda2                         ext4   2.0G  134M  1.7G   8% /boot
+/dev/sda1                         vfat   1.1G  6.1M  1.1G   1% /boot/efi
+tmpfs                             tmpfs  391M  4.0K  391M   1% /run/user/1000
+
+
+rambo@ub22:~$ ls -alh /dev/mapper/vg0-data--lv 
+lrwxrwxrwx 1 root root 7 May 26 17:47 /dev/mapper/vg0-data--lv -> ../dm-0
+
+# 因为之前已经在fstab中加入了lv的项，现在只需要改成用uuid的方法是并放开即可
+rambo@ub22:~$ grep data /etc/fstab (这种方式在大厂割接必翻车) 
+/dev/mapper/vg0-data--lv  /data  ext4  defaults  0  2
+
+rambo@ub22:~$ blkid /dev/mapper/vg0-data--lv
+/dev/mapper/vg0-data--lv: UUID="3312a46a-ab0f-43f2-aa75-d20efb2eaa81" BLOCK_SIZE="4096" TYPE="ext4"
+
+rambo@ub22:~$ grep data /etc/fstab 
+UUID=3312a46a-ab0f-43f2-aa75-d20efb2eaa81  /data  ext4  defaults  0  2
+释义：
+因为在KVM架构下，硬盘大概率会从esxi传统的 sdX 漂移变成半虚拟化的 vdX(如vda,vdb)。唯有UUID是生生世世焊死在文件系统里的，用UUID挂载，哪怕盘符漂移到天涯海角，开机网络通了之后，/data/prod_db.txt 依然能100%完好损无缝读取
+
+rambo@ub22:~$ sudo mount -a
+rambo@ub22:~$ df -Th
+Filesystem                        Type   Size  Used Avail Use% Mounted on
+tmpfs                             tmpfs  391M  1.1M  390M   1% /run
+/dev/mapper/ubuntu--vg-ubuntu--lv ext4    19G  7.2G   10G  43% /
+tmpfs                             tmpfs  2.0G     0  2.0G   0% /dev/shm
+tmpfs                             tmpfs  5.0M     0  5.0M   0% /run/lock
+/dev/sda2                         ext4   2.0G  134M  1.7G   8% /boot
+/dev/sda1                         vfat   1.1G  6.1M  1.1G   1% /boot/efi
+tmpfs                             tmpfs  391M  4.0K  391M   1% /run/user/1000
+/dev/mapper/vg0-data--lv          ext4    25G   28K   24G   1% /data                # 已经成功挂载
+
+# 查看之前做的测试数据
+rambo@ub22:~$ cat 1.txt 
+what are you doing
+rambo@ub22:~$ cat /data/prod_db.txt
+LVM multi-disk transfer test data 2026
+
+
+
+# 总结
+当你用 qemu-img 把这三块盘硬转到 PVE 上时，由于 VMware 转换到 KVM 后，底层的磁盘驱动从 sdX(SCSI)变成了 vdX(VirtIO)
+系统开机引导时，内核需要去扫描 /dev/vdb 和 /dev/vdg。如果系统里的 LVM 配置文件（/etc/lvm/lvm.conf）或者 udev 规则没有及时更新，或者系统启动由于没有 VirtIO 驱动导致根本认不出这两块盘，/etc/fstab 就会因为"找不到挂载设备"在开机阶段无限期卡死（Timeout），或者直接弹出 Welcome to emergency mode! 紧急救援提示
+
+多VG的底层迁移逻辑完全一样, 因为VG是存在磁盘上的
+更精准地用第一性原理来表述：LVM的所有元数据(包括有多少个PV、VG叫什么、LV怎么划分、UUID是什么)都是直接硬编码写在物理硬盘的头部(PV Header/扇区)的
+这就意味着：LVM 信息的载体是磁盘本身，而不是操作系统
+
+PVE端的"物理插槽顺序"绝对不能乱(最关键)
+原esxi顺序： sda=系统，sdb=10G，sdc=15G
+PVE挂载规范： 当在 PVE GUI 里把转换好的三块 .raw 盘挂载给VM时，必须严格按照大小和原本的业务顺序，精准挂载为scsi0(系统盘)、scsi1(10G盘)、scsi2(15G盘)
+如把15G的盘挂到了scsi1，10G的盘挂到了scsi2。虽然LVM依然能读出VG名字，但由于磁盘设备名(sdb 和 sdc)在系统底层发生了对调，这会导致某些没有写UUID而是写死设备名的应用(或者旧版文件系统)直接挂载报错
+
+
+```
