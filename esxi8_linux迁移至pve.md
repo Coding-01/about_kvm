@@ -117,6 +117,9 @@ Enable SSH = Enabled
 查看防火墙: esxcli network firewall ruleset list | grep ssh
 开启ssh服务：esxcli network firewall ruleset set -e true -r sshServer
 
+
+这份关于VMware迁移至PVE的笔记整体架构已经考虑到了分批割接、三网分离、限速控制、排错排查链以及反向回滚方案
+
 ```
 
 
@@ -138,7 +141,20 @@ Enable SSH = Enabled
 在绝大多数实际项目中，老运维都会明令禁止在搬迁时使用Cloud-init
 因为Cloud-init的原生设计场景是"从零初始化一个全新的干净系统(如刚购买的阿里云ess 裸机)"，而不是用来"接管一个已经跑了五六年的老系统"
 
-让 virt-v2v 只做它最擅长的事,把驱动(硬盘、网卡)转好，不要让它乱动网络配置文件
+让virt-v2v只做它最擅长的事,把驱动(硬盘、网卡)转好，不要让它乱动网络配置文件,不过单纯依赖virt-v2v流式网络转换，不仅效率低下且容错率极低
+virt-v2v这种上层工具本质上是一个"黑盒"，它干的事情可以拆解为两个最基础的底层维度:
+    数据传输(把数据挪过去) 和 内核手术(让系统在KVM架构下能起得来)
+    它之所以在企业生产环境中经常崩盘，是因为它把这两个维度强行捆绑在了一起，一旦网络断开、系统盘符特殊或者内核版本魔改，整个黑盒就宣告罢工
+在生产环境中通过vpx:// 或 sshfs 跨网络实时读取并转换几十T的数据，一旦网络出现短暂抖动或超时，转换就会瞬间崩溃(就会报nbdcopy: Input/output error). 且频繁调用ESXi API容易引发主机的防火墙或SSHD自保机制，严重时会导致宿主机生产管理端卡死
+
+企业级学要改进的方案：
+物理共享存储直挂(Zero-Copy架构): 如果企业原VMware集群使用的是iSCSI 或 Fibre Channel(FC)存储卷，不要通过网络导出
+正确的作法是在割接窗口直接在物理交换机上把LUN映射给pve物理集群的HBA卡/网卡，在pve宿主机上使用 vgchange -ay 激活卷，或者直接利用PVE 8.x 的 ESXi Native Storage Provider
+PVE8.x官方原生"esxi集成导入器"的底层接管:
+pve8.2+内置的导入机制不再依赖外部完整的libguestfs工具链，而是通过底层qemu-img直接读取esxi的vmdk描述符，并进行异步流式块写入(支持断点保护与更好的驱动注入成功率). 应该把官方导入器作为标准一桥，把virt-v2v降级为极个别魔改/老旧系统内核手工修复的备用兜底工具
+
+
+
 
 
 一、 网络层：引入"管理、存储、业务"三网分离架构
@@ -417,6 +433,37 @@ iface vmbr0 inet static
         bridge-stp off
         bridge-fd 0
 
+# ========== Linux Bond(LACP模式)叠加vlan划分(企业级) ===================
+生产宿主机必须使用2根物理万兆光纤线捆绑。应该给出标准的 /etc/network/interfaces 生产级高可用网络模板(基于802.3ad动态链路聚合模式)
+root@pve:~# nano /etc/network/interfaces
+# 物理光口1
+iface enp3s0f0 inet manual
+
+# 物理光口2
+iface enp3s0f1 inet manual
+
+# 捆绑为bond0
+auto bond0
+iface bond0 inet manual
+        bond-slaves enp3s0f0 enp3s0f1
+        bond-miimon 100
+        bond-mode 802.3ad
+        bond-xmit-hash-policy layer2+3
+
+# 基于LACP骨干链路上拉起的业务虚拟网桥(开启vlan感知)
+auto vmbr0
+iface vmbr0 inet manual
+        bridge-ports bond0
+        bridge-stp off
+        bridge-fd 0
+        bridge-vlan-aware yes
+
+# 管理网接口: 单独剥离VLAN 100
+auto vmbr0.100
+iface vmbr0.100 inet static
+        address 10.10.10.5/24
+        gateway 10.10.10.1
+# =======================================================================
 root@pve:~# cat /etc/hosts
 127.0.0.1 localhost.localdomain localhost
 192.168.2.142 pve.localdomain pve
@@ -503,8 +550,41 @@ systemctl restart pvedaemon pveproxy pvestatd
 ![image](./images/14.png)
 
 
+# esxi8的设置
+```shell
+alt+f1切换到字符界面, 可以使用命令，比如开启ssh服务
+alt+f2再切回到esxi的黄底界面
 
-# 在ESXi8.0上挂载此NFS存储(为迁移做准备)
+esxi8开启ssh服务
+在ESXi黄黑控制台：
+→ 输入 root 密码
+→ Troubleshooting Options                  # 确认以下2项都开启
+Enable ESXi Shell = Enabled
+Enable SSH = Enabled
+
+然后按ALT + F1(ALT + F2 是退回到黄黑的esxi管理页面)，进去执行/etc/init.d/SSH restart            # 不是小ssh
+
+如果已经进入ESXi Shell，常用运维命令：
+启动 SSH：vim-cmd hostsvc/start_ssh
+设置开机自启：vim-cmd hostsvc/enable_ssh
+关闭 SSH：vim-cmd hostsvc/stop_ssh
+取消自启：vim-cmd hostsvc/disable_ssh
+查看虚拟机：vim-cmd vmsvc/getallvms
+查看datastore：esxcli storage filesystem list
+重启管理服务：services.sh restart
+查看网卡：esxcli network nic list
+查看 VM 进程：esxcli vm process list
+查看防火墙: esxcli network firewall ruleset list | grep ssh
+开启ssh服务：esxcli network firewall ruleset set -e true -r sshServer
+
+
+
+
+```
+
+
+
+## 在ESXi8.0上挂载此NFS存储(为迁移做准备)
 ![image](./images/15.png)
 ![image](./images/16.png)
 ![image](./images/17.png)
@@ -563,7 +643,7 @@ crw-rw-rw- 1 root root 119, 1  5月 23 05:20 /dev/vmnet1
 crw-rw-rw- 1 root root 119, 2  5月 23 05:20 /dev/vmnet2
 crw-rw-rw- 1 root root 119, 8  5月 23 05:20 /dev/vmnet8
 
-3、重新打开 VMware Workstation，确保 ESXi 虚拟机的网卡设置里桥接模式(Bridged)下勾选了"复制物理网络连接状态"(Replicate physical network connection state)
+3、重新打开VMware Workstation，确保esxi虚拟机的网卡设置里桥接模式(Bridged)下勾选了"复制物理网络连接状态"(Replicate physical network connection state)
 
 # 第二步: 修改ESXi8.0内部的虚拟交换机安全策略(致命核心)
 即使外层放开了，ESXi8.0默认的虚拟交换机(vSwitch)安全策略也是极度严格的，它默认丢弃所有不是ESXi自身发出的流量
@@ -1442,12 +1522,27 @@ discard=on：开启回收空白块特性。因为我用的是raw格式，开启�
 # CentOS7.x传统BIOS传统网卡迁移
 ```shell
 2026年海外有无数中小企业的边缘业务还在跑CentOS7。这类系统迁移最容易卡死在"网卡规则锁定(udev)" 和 "旧版Initramfs缺少VirtIO驱动"上
-1. 手动注入VirtIO驱动：
-如果用qemu-img硬转CentOS7，开机通常会报error: no such device 或者直接挂载不进根目录。所以必须通过挂载ISO进入救援模式(Rescue Mode)强行把VirtIO模块塞进旧内核：
+1.initramfs预注入VirtIO驱动(主动防御，拒绝救援模式):
+与其等系统开机报错Kernel Panic再挂载iso进Rescue Mode重新生成dracut(如下图)，企业实施更讲究主动预埋
+在割接停机前10分钟，直接在原esxi运行中的Linux内执>行强制驱动预埋：
+CentOS/RHEL/Rocky: echo 'add_drivers+=" virtio virtio_blk virtio_pci virtio_net"' > /etc/dracut.conf.d/virtio.conf && dracut --f --regenerate-all
+Ubuntu/Debian: 在 /etc/initramfs-tools/modules 中追加 virtio、virtio_blk、virtio_pci、virtio_net，然后执行 update-initramfs -u -k all
+这样转换落盘后，pve直接拉起，100%避免由于没有KVM驱动而导致的引导挂载失败
+
+2. 或者开机后手动注入VirtIO驱动
+如果用qemu-img硬转CentOS7，开机通常会报error: no such device 或者直接挂载不进根目录
+所以必须通过挂载ISO进入救援模式(Rescue Mode)强行把VirtIO模块塞进旧内核：
 dracut --force --add-drivers "virtio virtio_prio virtio_ring virtio_pci virtio_scsi virtio_blk" /boot/initramfs-$(uname -r).img $(uname -r)
 
-2. 清理HWADDR(硬件MAC地址绑定):
-CentOS7极度喜欢把旧网卡的MAC地址写死在 /etc/sysconfig/network-scripts/ifcfg-eth0 里的HWADDR= 这一行。迁移到pve后，网卡MAC变了，网络绝对死活不通。所以必须上强行删掉HWADDR这一行的规范
+3. 清理HWADDR(硬件MAC地址绑定):
+CentOS7极度喜欢把旧网卡的MAC地址写死在 /etc/sysconfig/network-scripts/ifcfg-eth0 里的HWADDR= 这一行。迁移到pve后网卡MAC变了，网络绝对死活不通
+所以必须上强行删掉HWADDR这一行的规范
+
+4. 盘符漂移与UUID绑定固化
+在实际的企业级Linux生产环境中，vm往往挂载了多块大容量盘，且盘内包含极为复杂的lvm跨盘卷组(例如Oracle ASM、或者是多盘拼接的/data业务卷)
+VMware转换到KVM后，底层的磁盘驱动由sdX(SCSI)变为了vdX(VirtIO)
+在迁移前必须无条件全局排查源端Linux的/etc/fstab、/boot/grub2/grub.cfg
+如发现存在手工硬编码 /dev/sda1、/dev/sdb1 的老系统，必须在迁移前将其全部重写为UUID绑定(UUID=...)
 
 ```
 
@@ -1516,6 +1611,13 @@ VM 101 add unreferenced volume 'nfs-shared-storage1:101/vm-101-disk-0.raw' as 'u
 ![image](./images/81.png)
 ![image](./images/82.png)
 ![image](./images/83.png)
+```shell
+initramfs预注入VirtIO驱动(主动防御，拒绝救援模式):
+与其等系统开机报错Kernel Panic再挂载iso进Rescue Mode重新生成dracut(如下图)，企业实施更讲究主动预埋。在割接停机前10分钟，直接在原esxi运行中的Linux内执行强制驱动预埋：
+CentOS/RHEL/Rocky: echo 'add_drivers+=" virtio virtio_blk virtio_pci virtio_net"' > /etc/dracut.conf.d/virtio.conf && dracut --f --regenerate-all
+Ubuntu/Debian: 在 /etc/initramfs-tools/modules 中追加 virtio、virtio_blk、virtio_pci、virtio_net，然后执行 update-initramfs -u -k all
+这样转换落盘后，PVE 直接拉起，100% 避免由于没有 KVM 驱动而导致的引导挂载失败
+```
 ![image](./images/84.png)
 ![image](./images/85.png)
 ![image](./images/86.png)
@@ -1642,7 +1744,7 @@ sh-4.2# poweroff           # 重新设置第一启动项从硬盘启动
 
 
 
-## 实操centos7 LVM
+## 实操Ubuntu22 LVM
 ```shell
 在企业级生产环境中，多盘(Multi-disk)结合LVM(逻辑卷管理)是Linux服务器的标准配置。通过 qemu-img 纯数据流硬转这类系统时，最核心的第一性原理是：
 保证底层物理块设备(Disks)的完整映射与数量对齐，再进入系统内部激活逻辑卷层
